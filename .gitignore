@@ -6,13 +6,7 @@ __pycache__/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Data files
-*.csv
-*.xlsx
-*.feather
-*.parquet
-*.pkl
-*.pickle
+
 
 # Environment files
 .env

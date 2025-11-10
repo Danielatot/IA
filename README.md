@@ -81,3 +81,5 @@ A data science project for risk modeling using Python and R.
    install.packages(readLines("requirements/r.txt"))
    ```
 4. Run notebooks from the notebooks/ directory
+
+# Pycharm/DataSpell Setup
