@@ -1,8 +1,107 @@
 import os
 import pandas as pd
+import numpy as np
 import logging
 import inspect
-from typing import List, Union, Optional
+from typing import List, Union, Dict, Generator, Tuple, Callable
+
+def read_large_file(file_path: str, 
+                   file_type: str = 'csv',
+                   chunksize: int = 10000,
+                   verbose: bool = True,
+                   concatenate: bool = True) -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
+    """
+    Read large JSON or CSV file in chunks to avoid memory issues.
+
+    Parameters:
+    -----------
+    :param file_path: Path to the file to read
+    :type file_path: str
+    
+    :param file_type: Type of file to read ('csv' or 'json'), default: 'csv'
+    :type file_type: str
+    
+    :param chunksize: Number of rows per chunk (default: 10000)
+    :type chunksize: int
+    
+    :param verbose: Whether to print progress messages (default: True)
+    :type verbose: bool
+    
+    :param concatenate: If True, returns single concatenated DataFrame (default: True)
+    :type concatenate: bool
+
+    Returns:
+    --------
+    Union[Generator[pd.DataFrame, None, None], pd.DataFrame]
+        - If concatenate=False: Generator yielding DataFrames for each chunk
+        - If concatenate=True: Single DataFrame with all data
+    
+    Raises:
+    -------
+    ValueError: If file_type is not 'csv' or 'json'
+    FileNotFoundError: If file_path doesn't exist
+    MemoryError: If concatenate=True and file is too large for memory
+    """
+    # Validate file type parameter
+    if file_type not in ['csv', 'json']:
+        raise ValueError("file_type must be either 'csv' or 'json'")
+
+    # Enhanced file validation
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(
+            f"File not found at path: {file_path}\n"
+            f"Current working directory: {os.getcwd()}\n"
+            f"Please verify the file path is correct relative to the working directory"
+        )
+
+    if not os.path.isfile(file_path):
+        raise IsADirectoryError(f"Path exists but is a directory, not a file: {file_path}")
+
+    if not os.access(file_path, os.R_OK):
+        raise PermissionError(f"No read permissions for file: {file_path}")
+
+    # Validate file extension matches type
+    file_ext = os.path.splitext(file_path)[1].lower()
+    if (file_type == 'csv' and file_ext != '.csv') or (file_type == 'json' and file_ext not in ['.json', '.jsonl']):
+        print(f"Warning: File extension {file_ext} doesn't match specified type {file_type}")
+
+    if verbose:
+        print(f"Reading {file_type.upper()} file in chunks of {chunksize} rows from: {file_path}")
+        print(f"File size: {os.path.getsize(file_path)/1024/1024:.2f} MB")
+
+    if file_type == 'csv':
+        reader = pd.read_csv(file_path, chunksize=chunksize)
+    else:  # json
+        reader = pd.read_json(file_path, lines=True, chunksize=chunksize)
+
+    if concatenate:
+        try:
+            chunks = []
+            for i, chunk in enumerate(reader):
+                chunks.append(chunk)
+                if verbose:
+                    print(f"Processed chunk {i+1} with {len(chunk)} rows")
+            
+            if verbose:
+                print(f"Concatenating {len(chunks)} chunks...")
+            result = pd.concat(chunks, ignore_index=True)
+            
+            if verbose:
+                print(f"Finished reading and concatenating file: {file_path}")
+            return result
+            
+        except MemoryError:
+            raise MemoryError("File too large to concatenate - try with concatenate=False")
+
+    else:
+        for i, chunk in enumerate(reader):
+            if verbose:
+                print(f"Yielding chunk {i+1} with {len(chunk)} rows")
+            yield chunk
+
+        if verbose:
+            print(f"Finished reading file: {file_path}")
+
 
 def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
     """
@@ -224,7 +323,7 @@ def detailed_duplicate_analysis(df_list: List[pd.DataFrame],
 def remove_columns(df_list: List[pd.DataFrame],
                    columns_to_remove: List[str],
                    verbose: bool = True,
-                   inplace: bool = False) -> List[pd.DataFrame]:
+                   inplace: bool = True) -> List[pd.DataFrame]:
     """
     Remove columns from DataFrames. Skip columns that don't exist.
 
@@ -233,7 +332,7 @@ def remove_columns(df_list: List[pd.DataFrame],
     :param df_list : List of DataFrames to process
     :param columns_to_remove : List of column names to remove
     :param verbose : Whether to show what's happening
-    :param inplace : If False, returns new DataFrames (recommended)
+    :param inplace : If False, returns new DataFrames (default: True)
 
     Returns:
     --------
@@ -273,9 +372,6 @@ def remove_columns(df_list: List[pd.DataFrame],
         print(f"   ⏭️  Total columns skipped: {total_skipped}")
 
     return processed_dfs
-
-
-import pandas as pd
 
 
 def set_columns_to_datetime(data: Union[pd.DataFrame, List[pd.DataFrame]],
@@ -321,6 +417,258 @@ def set_columns_to_datetime(data: Union[pd.DataFrame, List[pd.DataFrame]],
         return processed_data
     else:
         raise ValueError("data must be a DataFrame or a list of DataFrames")
+
+
+def set_columns_to_numeric(data: Union[pd.DataFrame, List[pd.DataFrame]],
+                         numeric_columns: Union[str, List[str]],
+                         drop_columns: Union[str, List[str]] = None,
+                         verbose: bool = True,
+                         inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+    """
+    Convert specified columns to numeric type in DataFrame(s) and optionally drop columns.
+
+    Parameters:
+    -----------
+    :param data: Input DataFrame or list of DataFrames to process
+    :type data: Union[pd.DataFrame, List[pd.DataFrame]]
+    
+    :param numeric_columns: Column name(s) to convert to numeric type
+    :type numeric_columns: Union[str, List[str]]
+    
+    :param drop_columns: Optional column name(s) to drop after conversion (default: None)
+    :type drop_columns: Union[str, List[str]]
+    
+    :param verbose: Whether to print progress messages (default: True)
+    :type verbose: bool
+    
+    :param inplace: If False, returns new DataFrame(s) (default: True)
+    :type inplace: bool
+
+    Returns:
+    --------
+    Union[pd.DataFrame, List[pd.DataFrame]]
+        Processed DataFrame(s) with specified columns converted to numeric type
+    """
+    # Handle single DataFrame input
+    if isinstance(data, pd.DataFrame):
+        if not inplace:
+            data = data.copy()
+        
+        # Convert columns to list if single string provided
+        cols_to_convert = [numeric_columns] if isinstance(numeric_columns, str) else numeric_columns
+        
+        for col in cols_to_convert:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+                if verbose:
+                    print(f"Converted column '{col}' to numeric type")
+            elif verbose:
+                print(f"Column '{col}' not found - skipping")
+        
+        # Handle column dropping if specified
+        if drop_columns:
+            drop_cols = [drop_columns] if isinstance(drop_columns, str) else drop_columns
+            data.drop(columns=[col for col in drop_cols if col in data.columns], inplace=True)
+        
+        return data
+    
+    # Handle list of DataFrames
+    elif isinstance(data, list):
+        processed_dfs = []
+        for i, df in enumerate(data):
+            if verbose:
+                print(f"\nProcessing DataFrame {i}")
+            processed_df = set_columns_to_numeric(df, numeric_columns, drop_columns, verbose, inplace)
+            processed_dfs.append(processed_df)
+        return processed_dfs
+    
+    else:
+        raise TypeError("Input data must be a pandas DataFrame or list of DataFrames")
+
+
+def remove_rows_by_value(data: Union[pd.DataFrame, List[pd.DataFrame]],
+                       columns: Union[str, List[str]],
+                       values: Union[str, List[str], int, float, List[Union[str, int, float]]],
+                       verbose: bool = True,
+                       inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+    """
+    Remove rows from DataFrame(s) where specified columns contain any of the specified values.
+
+    Parameters:
+    -----------
+    :param data: Input DataFrame or list of DataFrames to process
+    :type data: Union[pd.DataFrame, List[pd.DataFrame]]
+    
+    :param columns: Column name(s) to check for values
+    :type columns: Union[str, List[str]]
+    
+    :param values: Value(s) to match for row removal
+    :type values: Union[str, List[str], int, float, List[Union[str, int, float]]]
+    
+    :param verbose: Whether to print progress messages (default: True)
+    :type verbose: bool
+    
+    :param inplace: If False, returns new DataFrame(s) (default: True)
+    :type inplace: bool
+
+    Returns:
+    --------
+    Union[pd.DataFrame, List[pd.DataFrame]]
+        Processed DataFrame(s) with matching rows removed
+    """
+    # Convert single DataFrame to list for uniform processing
+    single_df = False
+    if isinstance(data, pd.DataFrame):
+        data = [data]
+        single_df = True
+
+    # Convert parameters to lists if they are single values
+    columns_list = [columns] if isinstance(columns, str) else columns
+    if not isinstance(values, (list, tuple)):
+        values_list = [values]
+    else:
+        values_list = list(values)
+
+    processed_dfs = []
+    total_removed = 0
+
+    for i, df in enumerate(data):
+        if not inplace:
+            df = df.copy()
+
+        # Create mask for rows to keep (not containing any of the values in specified columns)
+        mask = pd.Series(True, index=df.index)
+        for col in columns_list:
+            if col in df.columns:
+                col_mask = ~df[col].isin(values_list)
+                mask = mask & col_mask
+                if verbose:
+                    print(f"DataFrame {i}: Checking column '{col}' for {len(values_list)} values")
+            elif verbose:
+                print(f"DataFrame {i}: Column '{col}' not found - skipping")
+
+        # Apply the mask
+        rows_before = len(df)
+        df = df[mask]
+        rows_removed = rows_before - len(df)
+        total_removed += rows_removed
+
+        if verbose:
+            print(f"DataFrame {i}: Removed {rows_removed} rows based on value matches")
+        
+        processed_dfs.append(df)
+
+    # Final summary
+    if verbose:
+        print(f"\n🎯 FINAL SUMMARY:")
+        print(f"   📦 Processed {len(data)} DataFrames")
+        print(f"   🗑️  Total rows removed: {total_removed}")
+
+    return processed_dfs[0] if single_df else processed_dfs
+
+
+def pivot_columns(data: Union[pd.DataFrame, List[pd.DataFrame]],
+                 pivot_column: str,
+                 value_columns: Union[str, List[str]],
+                 prefix: str = None,
+                 suffix: str = None,
+                 verbose: bool = True,
+                 inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+    """
+    Pivot specified columns to create new columns based on unique values in pivot column.
+
+    Parameters:
+    -----------
+    :param data: Input DataFrame or list of DataFrames to process
+    :type data: Union[pd.DataFrame, List[pd.DataFrame]]
+    
+    :param pivot_column: Column containing values to create new columns from
+    :type pivot_column: str
+    
+    :param value_columns: Column(s) to pivot
+    :type value_columns: Union[str, List[str]]
+    
+    :param prefix: Optional prefix for new column names
+    :type prefix: str
+    
+    :param suffix: Optional suffix for new column names
+    :type suffix: str
+    
+    :param verbose: Whether to print progress messages (default: True)
+    :type verbose: bool
+    
+    :param inplace: If False, returns new DataFrame(s) (default: True)
+    :type inplace: bool
+
+    Returns:
+    --------
+    Union[pd.DataFrame, List[pd.DataFrame]]
+        Processed DataFrame(s) with:
+        - New columns added for each unique value in pivot_column
+        - All original columns preserved exactly as they were
+        - Original column values remain unchanged
+        - New columns will contain:
+          * Original values where pivot_column matched the value
+          * NaN where pivot_column didn't match
+        - Rows maintain their original order
+    """
+    # Convert single DataFrame to list for uniform processing
+    single_df = False
+    if isinstance(data, pd.DataFrame):
+        data = [data]
+        single_df = True
+
+    # Convert value_columns to list if single string
+    value_cols = [value_columns] if isinstance(value_columns, str) else value_columns
+
+    processed_dfs = []
+    total_new_columns = 0
+
+    for i, df in enumerate(data):
+        if not inplace:
+            df = df.copy()
+
+        if pivot_column not in df.columns:
+            if verbose:
+                print(f"DataFrame {i}: Pivot column '{pivot_column}' not found - skipping")
+            processed_dfs.append(df)
+            continue
+
+        # Get unique values from pivot column
+        unique_values = df[pivot_column].unique()
+        if verbose:
+            print(f"DataFrame {i}: Found {len(unique_values)} unique values in '{pivot_column}'")
+
+        # Create new columns for each value in pivot_column
+        for value in unique_values:
+            for col in value_cols:
+                if col not in df.columns:
+                    if verbose:
+                        print(f"DataFrame {i}: Value column '{col}' not found - skipping")
+                    continue
+
+                # Create new column name
+                new_col_name = f"{prefix + '_' if prefix else ''}{col}_{value}{'_' + suffix if suffix else ''}"
+                
+                # Create mask for rows where pivot_column equals current value
+                mask = df[pivot_column] == value
+                
+                # Create new column with values from original column where mask is True
+                df[new_col_name] = df.loc[mask, col]
+                total_new_columns += 1
+
+                if verbose:
+                    print(f"DataFrame {i}: Created column '{new_col_name}'")
+
+        processed_dfs.append(df)
+
+    # Final summary
+    if verbose:
+        print(f"\n🎯 FINAL SUMMARY:")
+        print(f"   📦 Processed {len(data)} DataFrames")
+        print(f"   🆕 Total new columns created: {total_new_columns}")
+
+    return processed_dfs[0] if single_df else processed_dfs
 
 
 def rename_columns_if_exist(data: Union[pd.DataFrame, List[pd.DataFrame]],
@@ -377,7 +725,7 @@ def rename_columns_if_exist(data: Union[pd.DataFrame, List[pd.DataFrame]],
 def extract_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                     columns: Union[str, List[str]],
                     remove_from_original: bool = False,
-                    inplace: bool = False) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                    inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame]]:
     """
     Extract specific columns from DataFrame(s), optionally removing them from original.
 
@@ -392,7 +740,7 @@ def extract_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
     :param remove_from_original: Whether to remove extracted columns from original (default: False)
     :type remove_from_original: bool
     
-    :param inplace: Whether to modify original DataFrame(s) when remove_from_original is True (default: False)
+    :param inplace: Whether to modify original DataFrame(s) when remove_from_original is True (default: True)
     :type inplace: bool
 
     Returns:
@@ -485,9 +833,6 @@ def extract_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
             return extracted_dfs
 
 
-import pandas as pd
-from typing import Union, List, Tuple, Callable
-import numpy as np
 
 ### Column merger
 
