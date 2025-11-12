@@ -82,6 +82,8 @@ A data science project for risk modeling using Python and R.
    ```
 4. Run notebooks from the notebooks/ directory
 
+   ---------
+
 # Pycharm/DataSpell Specific Setup
 
 You can use Pycharm or DataSpell to run the notebooks. Here are the steps to set up Pycharm/DataSpell.
