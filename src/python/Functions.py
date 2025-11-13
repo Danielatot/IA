@@ -5,11 +5,56 @@ import logging
 import inspect
 from typing import List, Union, Dict, Generator, Tuple, Callable
 
-def read_large_file(file_path: str, 
-                   file_type: str = 'csv',
-                   chunksize: int = 10000,
-                   verbose: bool = True,
-                   concatenate: bool = True) -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
+
+def check_and_pull_git_lfs():
+    """
+    Check for Git LFS pointers and pull actual files if needed.
+    Returns True if pull was attempted/successful, False otherwise.
+    """
+    import os
+    import subprocess
+
+    # Check if we're in a git repository
+    try:
+        result = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
+                                capture_output=True, text=True, check=True)
+        if result.stdout.strip() != 'true':
+            print("Not in a git repository")
+            return False
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Git not available or not in a git repository")
+        return False
+
+    # Check if LFS is installed
+    try:
+        subprocess.run(['git', 'lfs', 'version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Git LFS is not installed. Please install Git LFS first.")
+        return False
+
+    # Check if there are LFS files that need pulling
+    try:
+        lfs_status = subprocess.run(['git', 'lfs', 'status'],
+                                    capture_output=True, text=True, check=True)
+        if "to be downloaded" in lfs_status.stdout:
+            print("Git LFS files need downloading. Running 'git lfs pull'...")
+            # Actually pull the LFS files
+            pull_result = subprocess.run(['git', 'lfs', 'pull'],
+                                         capture_output=True, text=True, check=True)
+            print("Git LFS pull completed successfully")
+            return True
+        else:
+            print("No Git LFS files need downloading")
+            return False
+    except subprocess.CalledProcessError as e:
+        print(f"Error checking LFS status: {e}")
+        return False
+
+def read_large_file(file_path: str,
+                    file_type: str = 'csv',
+                    chunksize: int = 10000,
+                    verbose: bool = True,
+                    concatenate: bool = True) -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
     """
     Read large JSON or CSV file in chunks to avoid memory issues.
 
@@ -17,16 +62,16 @@ def read_large_file(file_path: str,
     -----------
     :param file_path: Path to the file to read
     :type file_path: str
-    
+
     :param file_type: Type of file to read ('csv' or 'json'), default: 'csv'
     :type file_type: str
-    
+
     :param chunksize: Number of rows per chunk (default: 10000)
     :type chunksize: int
-    
+
     :param verbose: Whether to print progress messages (default: True)
     :type verbose: bool
-    
+
     :param concatenate: If True, returns single concatenated DataFrame (default: True)
     :type concatenate: bool
 
@@ -35,7 +80,7 @@ def read_large_file(file_path: str,
     Union[Generator[pd.DataFrame, None, None], pd.DataFrame]
         - If concatenate=False: Generator yielding DataFrames for each chunk
         - If concatenate=True: Single DataFrame with all data
-    
+
     Raises:
     -------
     ValueError: If file_type is not 'csv' or 'json'
@@ -65,43 +110,83 @@ def read_large_file(file_path: str,
     if (file_type == 'csv' and file_ext != '.csv') or (file_type == 'json' and file_ext not in ['.json', '.jsonl']):
         print(f"Warning: File extension {file_ext} doesn't match specified type {file_type}")
 
+    # Check if file is empty
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        raise ValueError(f"File is empty: {file_path}")
+
     if verbose:
         print(f"Reading {file_type.upper()} file in chunks of {chunksize} rows from: {file_path}")
-        print(f"File size: {os.path.getsize(file_path)/1024/1024:.2f} MB")
+        print(f"File size: {os.path.getsize(file_path) / 1024 / 1024:.2f} MB")
 
-    if file_type == 'csv':
-        reader = pd.read_csv(file_path, chunksize=chunksize)
-    else:  # json
-        reader = pd.read_json(file_path, lines=True, chunksize=chunksize)
+    try:
+        # Create appropriate reader based on file type
+        if file_type == 'csv':
+            reader = pd.read_csv(file_path, chunksize=chunksize)
+        else:  # json
+            reader = pd.read_json(file_path, lines=True, chunksize=chunksize)
+
+    except ValueError as e:
+        # Handle JSON format issues specifically
+        if "lines" in str(e) and file_type == 'json':
+            raise ValueError(
+                f"JSON file may not be in line-delimited format. "
+                f"JSON files must be in JSONL (JSON Lines) format for chunked reading. "
+                f"Each line must be a valid JSON object."
+            ) from e
+        raise
 
     if concatenate:
         try:
             chunks = []
+            total_rows = 0
             for i, chunk in enumerate(reader):
                 chunks.append(chunk)
+                total_rows += len(chunk)
                 if verbose:
-                    print(f"Processed chunk {i+1} with {len(chunk)} rows")
-            
+                    print(f"Processed chunk {i + 1} with {len(chunk)} rows (total: {total_rows})")
+
+            # Check if any data was actually read
+            if not chunks:
+                if verbose:
+                    print("Warning: No data chunks were read - file may be empty or malformed")
+                return pd.DataFrame()
+
             if verbose:
                 print(f"Concatenating {len(chunks)} chunks...")
             result = pd.concat(chunks, ignore_index=True)
-            
+
             if verbose:
                 print(f"Finished reading and concatenating file: {file_path}")
+                print(f"Final DataFrame shape: {result.shape}")
             return result
-            
+
         except MemoryError:
-            raise MemoryError("File too large to concatenate - try with concatenate=False")
+            raise MemoryError(
+                "File too large to concatenate into single DataFrame. "
+                "Try setting concatenate=False to work with chunks individually."
+            )
 
     else:
-        for i, chunk in enumerate(reader):
-            if verbose:
-                print(f"Yielding chunk {i+1} with {len(chunk)} rows")
-            yield chunk
+        # Return generator that yields chunks
+        def chunk_generator():
+            total_rows = 0
+            try:
+                for i, chunk in enumerate(reader):
+                    if verbose:
+                        print(f"Yielding chunk {i + 1} with {len(chunk)} rows")
+                    total_rows += len(chunk)
+                    yield chunk
 
-        if verbose:
-            print(f"Finished reading file: {file_path}")
+                if verbose:
+                    print(f"Finished reading file: {file_path}")
+                    print(f"Total rows processed: {total_rows}")
 
+            except Exception as e:
+                print(f"Error during chunk reading: {e}")
+                raise
+
+        return chunk_generator()
 
 def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
     """
