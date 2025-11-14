@@ -670,6 +670,76 @@ def pivot_columns(data: Union[pd.DataFrame, List[pd.DataFrame]],
 
     return processed_dfs[0] if single_df else processed_dfs
 
+def pivot_dfs_smart(df_list):
+    """
+    Apply pivot transformation with smart aggregation for different column types.
+    """
+
+    def pivot_line_names_to_columns_smart(df):
+        """
+        Pivot with intelligent aggregation based on column data types.
+        """
+        # Identify column types for smart aggregation
+        numeric_columns = []
+        string_columns = []
+
+        for col in df.columns:
+            if col in ['line_name', 'reiksme']:
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                numeric_columns.append(col)
+            else:
+                string_columns.append(col)
+
+        # Create aggregation dictionary
+        aggregation_dict = {'reiksme': 'first'}
+
+        # For numeric columns, use 'first' or 'mean' depending on context
+        for col in numeric_columns:
+            aggregation_dict[col] = 'first'
+
+        # For string columns, use 'first' (take the first occurrence)
+        for col in string_columns:
+            aggregation_dict[col] = 'first'
+
+        # Identify index columns (all columns except line_name and reiksme)
+        index_columns = [col for col in df.columns if col not in ['line_name', 'reiksme']]
+
+        # Perform pivot
+        pivoted_df = df.pivot_table(
+            index=index_columns,
+            columns='line_name',
+            values='reiksme',
+            aggfunc='first'
+        ).reset_index()
+
+        # Reset column names
+        pivoted_df.columns.name = None
+
+        return pivoted_df
+
+    pivoted_dfs = []
+
+    for i, df in enumerate(df_list):
+        try:
+            required_columns = ['line_name', 'reiksme', 'ja_kodas']
+            if not all(col in df.columns for col in required_columns):
+                missing_cols = [col for col in required_columns if col not in df.columns]
+                print(f"DataFrame {i}: Missing columns {missing_cols}")
+                pivoted_dfs.append(df)
+                continue
+
+            print(f"DataFrame {i}: Preserving {len(df.columns) - 2} columns in result")
+
+            pivoted_df = pivot_line_names_to_columns_smart(df)
+            pivoted_dfs.append(pivoted_df)
+            print(f"DataFrame {i}: Successfully pivoted. Original shape: {df.shape}, Pivoted shape: {pivoted_df.shape}")
+
+        except Exception as e:
+            print(f"DataFrame {i}: Error during pivoting - {e}")
+            pivoted_dfs.append(df)
+
+    return pivoted_dfs
 
 def rename_columns_if_exist(data: Union[pd.DataFrame, List[pd.DataFrame]],
                            current_columns: Union[str, List[str]],
