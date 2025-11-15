@@ -4,7 +4,7 @@ import numpy as np
 import logging
 import inspect
 import subprocess
-from typing import List, Union, Dict, Generator, Tuple, Callable
+from typing import List, Union, Dict, Generator, Tuple, Callable, Any
 
 
 def check_and_pull_git_lfs():
