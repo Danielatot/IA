@@ -6,7 +6,365 @@ import inspect
 import subprocess
 from typing import List, Union, Dict, Generator, Tuple, Callable, Any
 
+def read_large_file(file_path: str,
+                    file_type: str = 'csv',
+                    chunksize: int = 10000,
+                    verbose: bool = True,
+                    concatenate: bool = True,
+                    auto_handle_lfs: bool = False,
+                    delimiter: str = 'auto',
+                    error_bad_lines: bool = True,
+                    on_bad_lines: str = 'error',
+                    encoding: str = 'utf-8') -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
+    """
+    Read large JSON or CSV file in chunks to avoid memory issues.
 
+    Parameters:
+    -----------
+    :param file_path: Path to the file to read
+    :type file_path: str
+
+    :param file_type: Type of file to read ('csv' or 'json'), default: 'csv'
+    :type file_type: str
+
+    :param chunksize: Number of rows per chunk (default: 10000)
+    :type chunksize: int
+
+    :param verbose: Whether to print progress messages (default: True)
+    :type verbose: bool
+
+    :param concatenate: If True, returns single concatenated DataFrame (default: True)
+    :type concatenate: bool
+
+    :param auto_handle_lfs: If True, automatically tries to pull Git LFS files when detected (default: False)
+    :type auto_handle_lfs: bool
+
+    :param delimiter: CSV delimiter character. Use 'auto' for automatic detection (default: 'auto')
+    :type delimiter: str
+
+    :param error_bad_lines: If True, raise exception on bad CSV lines (default: True)
+    :type error_bad_lines: bool
+
+    :param on_bad_lines: How to handle bad CSV lines: 'error', 'warn', 'skip' (default: 'error')
+    :type on_bad_lines: str
+
+    :param encoding: File encoding to use (default: 'utf-8')
+    :type encoding: str
+
+    Returns:
+    --------
+    Union[Generator[pd.DataFrame, None, None], pd.DataFrame]
+        - If concatenate=False: Generator yielding DataFrames for each chunk
+        - If concatenate=True: Single DataFrame with all data
+
+    Raises:
+    -------
+    ValueError: If file_type is not 'csv' or 'json'
+    FileNotFoundError: If file_path doesn't exist
+    pd.errors.ParserError: If CSV parsing fails and error_bad_lines=True
+    """
+    import os
+    import pandas as pd
+    import json
+    from typing import Union, Generator
+
+    # Validate file type parameter
+    if file_type not in ['csv', 'json']:
+        raise ValueError("file_type must be either 'csv' or 'json'")
+
+    # Validate on_bad_lines parameter
+    if on_bad_lines not in ['error', 'warn', 'skip']:
+        raise ValueError("on_bad_lines must be 'error', 'warn', or 'skip'")
+
+    # Enhanced file validation
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at path: {file_path}")
+
+    if verbose:
+        print(f"Reading {file_type.upper()} file from: {file_path}")
+        print(f"File size: {os.path.getsize(file_path) / 1024 / 1024:.2f} MB")
+
+    def detect_csv_delimiter(file_path: str, sample_lines: int = 20, encoding: str = 'utf-8') -> str:
+        """
+        Detect the delimiter used in a CSV file.
+
+        Parameters:
+        -----------
+        file_path: Path to the CSV file
+        sample_lines: Number of lines to sample for detection
+        encoding: File encoding
+
+        Returns:
+        --------
+        str: Detected delimiter character
+        """
+        import csv
+
+        # Common delimiters to check (ordered by likelihood)
+        delimiters = [',', '\t', ';', '|', ':']
+        delimiter_counts = {delim: [] for delim in delimiters}  # Store counts per line
+
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                lines_read = 0
+                for i, line in enumerate(f):
+                    if i >= sample_lines:
+                        break
+                    if line.strip():  # Skip empty lines
+                        lines_read += 1
+                        for delim in delimiters:
+                            count = line.count(delim)
+                            delimiter_counts[delim].append(count)
+
+                if lines_read == 0:
+                    if verbose:
+                        print("Warning: File appears to be empty or contains only empty lines")
+                    return ','  # Default to comma
+
+            # Analyze the results
+            delimiter_scores = {}
+
+            for delim, counts in delimiter_counts.items():
+                if not counts:  # No data for this delimiter
+                    continue
+
+                # Calculate score based on:
+                # 1. Average count per line (higher is better)
+                # 2. Consistency across lines (lower std dev is better)
+                # 3. Non-zero counts (we want delimiters that appear in most lines)
+                avg_count = sum(counts) / len(counts)
+                non_zero_lines = sum(1 for c in counts if c > 0)
+                consistency_score = non_zero_lines / len(counts)
+
+                # Penalize delimiters that appear inconsistently
+                if avg_count > 0 and consistency_score > 0.5:
+                    # Base score on average count, weighted by consistency
+                    delimiter_scores[delim] = avg_count * consistency_score
+
+            if not delimiter_scores:
+                if verbose:
+                    print("Warning: Could not detect delimiter reliably, defaulting to comma")
+                return ','
+
+            # Get the delimiter with the highest score
+            detected_delimiter = max(delimiter_scores, key=delimiter_scores.get)
+            highest_score = delimiter_scores[detected_delimiter]
+
+            if verbose:
+                print(f"Delimiter detection scores: {delimiter_scores}")
+                print(f"Detected delimiter: '{detected_delimiter}' (score: {highest_score:.2f})")
+
+            return detected_delimiter
+
+        except UnicodeDecodeError as e:
+            if verbose:
+                print(f"Encoding error during delimiter detection: {e}")
+                print("Trying common alternative encodings...")
+
+            # Try common alternative encodings
+            alternative_encodings = ['latin-1', 'iso-8859-1', 'cp1252', 'utf-16']
+            for alt_encoding in alternative_encodings:
+                try:
+                    if verbose:
+                        print(f"Trying encoding: {alt_encoding}")
+                    return detect_csv_delimiter(file_path, sample_lines, alt_encoding)
+                except UnicodeDecodeError:
+                    continue
+
+            if verbose:
+                print("Could not detect delimiter with any encoding, defaulting to comma")
+            return ','
+
+        except Exception as e:
+            if verbose:
+                print(f"Error during delimiter detection: {e}")
+            return ','  # Default fallback
+
+    try:
+        if file_type == 'csv':
+            # Handle delimiter detection
+            final_delimiter = delimiter
+            if delimiter == 'auto':
+                if verbose:
+                    print("Auto-detecting CSV delimiter...")
+                final_delimiter = detect_csv_delimiter(file_path, encoding=encoding)
+            else:
+                if verbose:
+                    print(f"Using specified delimiter: '{delimiter}'")
+
+            if verbose:
+                print(f"Bad lines handling: {on_bad_lines}")
+                print(f"File encoding: {encoding}")
+
+            # Handle different pandas versions for error handling
+            read_csv_kwargs = {
+                'filepath_or_buffer': file_path,
+                'chunksize': chunksize,
+                'delimiter': final_delimiter,
+                'on_bad_lines': on_bad_lines,
+                'encoding': encoding,
+            }
+
+            # For older pandas versions that use error_bad_lines
+            try:
+                reader = pd.read_csv(**read_csv_kwargs)
+            except TypeError as e:
+                if "unexpected keyword argument 'on_bad_lines'" in str(e):
+                    if verbose:
+                        print("Using legacy error_bad_lines parameter for older pandas version")
+                    # Fall back to error_bad_lines for older pandas
+                    read_csv_kwargs.pop('on_bad_lines')
+                    read_csv_kwargs['error_bad_lines'] = error_bad_lines
+                    read_csv_kwargs['warn_bad_lines'] = (on_bad_lines == 'warn')
+                    reader = pd.read_csv(**read_csv_kwargs)
+                else:
+                    raise
+
+        else:  # json
+            # First, detect the JSON format
+            with open(file_path, 'r', encoding=encoding) as f:
+                first_line = f.readline().strip()
+                second_line = f.readline().strip() if first_line else ""
+
+            # Check if it's JSONL format (each line is a complete JSON object)
+            is_jsonl = False
+            try:
+                # Try to parse first line as JSON
+                if first_line:
+                    json.loads(first_line)
+                    # If first line is valid JSON, check if second line is also valid JSON
+                    if second_line:
+                        try:
+                            json.loads(second_line)
+                            is_jsonl = True
+                        except json.JSONDecodeError:
+                            # Only first line is valid JSON, might be single JSON array/object
+                            is_jsonl = False
+            except json.JSONDecodeError:
+                is_jsonl = False
+
+            if is_jsonl:
+                if verbose:
+                    print("Detected JSONL format (line-delimited JSON)")
+                reader = pd.read_json(file_path, lines=True, chunksize=chunksize, encoding=encoding)
+            else:
+                if verbose:
+                    print("Detected standard JSON format (array/object)")
+                # For standard JSON, we need to read the whole file and chunk it manually
+                if concatenate:
+                    # Read entire JSON file
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        data = json.load(f)
+
+                    # Convert to DataFrame based on structure
+                    if isinstance(data, list):
+                        df = pd.DataFrame(data)
+                        if verbose:
+                            print(f"Read JSON array with {len(df)} rows")
+                        return df
+                    elif isinstance(data, dict):
+                        # If it's a single object, create DataFrame with one row
+                        if any(isinstance(v, (list, dict)) for v in data.values()):
+                            # Complex nested structure - normalize it
+                            df = pd.json_normalize(data)
+                        else:
+                            df = pd.DataFrame([data])
+                        if verbose:
+                            print(f"Read JSON object, created DataFrame with {len(df)} rows")
+                        return df
+                    else:
+                        raise ValueError(f"Unsupported JSON structure: {type(data)}")
+                else:
+                    # For chunking standard JSON, we need to implement custom logic
+                    raise NotImplementedError(
+                        "Chunked reading not supported for standard JSON format. "
+                        "Use concatenate=True or convert to JSONL format."
+                    )
+
+    except pd.errors.ParserError as e:
+        if verbose:
+            print(f"CSV parsing error: {e}")
+            print("This often occurs due to:")
+            print("1. Inconsistent number of fields across rows")
+            print("2. Incorrect delimiter")
+            print("3. Unescaped quotes or special characters")
+            print("4. Mixed data types in columns")
+
+        # Provide helpful suggestions
+        suggestions = []
+        if "Expected" in str(e) and "saw" in str(e):
+            suggestions.append("Try using a different delimiter with the 'delimiter' parameter")
+            suggestions.append("Try setting on_bad_lines='warn' or 'skip' to ignore problematic lines")
+            suggestions.append("Check the specific line mentioned in the error for formatting issues")
+            suggestions.append("Try specifying encoding if file contains special characters")
+
+        if suggestions:
+            print("Suggestions to fix:")
+            for suggestion in suggestions:
+                print(f"  - {suggestion}")
+
+        raise
+
+    except UnicodeDecodeError as e:
+        if verbose:
+            print(f"Encoding error: {e}")
+            print("Try specifying a different encoding parameter")
+            print("Common encodings: 'latin-1', 'iso-8859-1', 'cp1252', 'utf-16'")
+        raise
+
+    except Exception as e:
+        if verbose:
+            print(f"Error reading file: {e}")
+        raise
+
+    if concatenate:
+        try:
+            chunks = []
+            total_rows = 0
+            bad_lines_count = 0
+
+            for i, chunk in enumerate(reader):
+                chunks.append(chunk)
+                total_rows += len(chunk)
+                if verbose:
+                    print(f"Processed chunk {i + 1} with {len(chunk)} rows (total: {total_rows})")
+
+            if not chunks:
+                if verbose:
+                    print("Warning: No data chunks were read")
+                return pd.DataFrame()
+
+            if verbose:
+                print(f"Concatenating {len(chunks)} chunks...")
+            result = pd.concat(chunks, ignore_index=True)
+
+            if verbose:
+                print(f"Finished reading. Total rows: {len(result)}")
+                if bad_lines_count > 0:
+                    print(f"Warning: {bad_lines_count} bad lines were skipped")
+
+            return result
+
+        except MemoryError:
+            raise MemoryError("File too large to concatenate - try with concatenate=False")
+
+    else:
+        def chunk_generator():
+            total_rows = 0
+            bad_lines_count = 0
+
+            for i, chunk in enumerate(reader):
+                if verbose:
+                    print(f"Yielding chunk {i + 1} with {len(chunk)} rows")
+                total_rows += len(chunk)
+                yield chunk
+
+            if verbose:
+                print(f"Finished reading. Total rows: {total_rows}")
+                if bad_lines_count > 0:
+                    print(f"Warning: {bad_lines_count} bad lines were skipped")
+
+        return chunk_generator()
 def check_and_pull_git_lfs():
     """
     Check for Git LFS pointers and pull actual files if needed.
@@ -85,166 +443,6 @@ def check_and_pull_git_lfs():
             print(f"Error details: {e.stderr}")
         return False
 
-def read_large_file(file_path: str,
-                    file_type: str = 'csv',
-                    chunksize: int = 10000,
-                    verbose: bool = True,
-                    concatenate: bool = True,
-                    auto_handle_lfs: bool = False) -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
-    """
-    Read large JSON or CSV file in chunks to avoid memory issues.
-
-    Parameters:
-    -----------
-    :param file_path: Path to the file to read
-    :type file_path: str
-
-    :param file_type: Type of file to read ('csv' or 'json'), default: 'csv'
-    :type file_type: str
-
-    :param chunksize: Number of rows per chunk (default: 10000)
-    :type chunksize: int
-
-    :param verbose: Whether to print progress messages (default: True)
-    :type verbose: bool
-
-    :param concatenate: If True, returns single concatenated DataFrame (default: True)
-    :type concatenate: bool
-
-    :param auto_handle_lfs: If True, automatically tries to pull Git LFS files when detected (default: False)
-    :type auto_handle_lfs: bool
-
-    Returns:
-    --------
-    Union[Generator[pd.DataFrame, None, None], pd.DataFrame]
-        - If concatenate=False: Generator yielding DataFrames for each chunk
-        - If concatenate=True: Single DataFrame with all data
-    """
-    import os
-    import pandas as pd
-    import json
-    from typing import Union, Generator
-
-    # Validate file type parameter
-    if file_type not in ['csv', 'json']:
-        raise ValueError("file_type must be either 'csv' or 'json'")
-
-    # Enhanced file validation
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found at path: {file_path}")
-
-    if verbose:
-        print(f"Reading {file_type.upper()} file from: {file_path}")
-        print(f"File size: {os.path.getsize(file_path) / 1024 / 1024:.2f} MB")
-
-    try:
-        if file_type == 'csv':
-            reader = pd.read_csv(file_path, chunksize=chunksize)
-        else:  # json
-            # First, detect the JSON format
-            with open(file_path, 'r') as f:
-                first_line = f.readline().strip()
-                second_line = f.readline().strip() if first_line else ""
-
-            # Check if it's JSONL format (each line is a complete JSON object)
-            is_jsonl = False
-            try:
-                # Try to parse first line as JSON
-                if first_line:
-                    json.loads(first_line)
-                    # If first line is valid JSON, check if second line is also valid JSON
-                    if second_line:
-                        try:
-                            json.loads(second_line)
-                            is_jsonl = True
-                        except json.JSONDecodeError:
-                            # Only first line is valid JSON, might be single JSON array/object
-                            is_jsonl = False
-            except json.JSONDecodeError:
-                is_jsonl = False
-
-            if is_jsonl:
-                if verbose:
-                    print("Detected JSONL format (line-delimited JSON)")
-                reader = pd.read_json(file_path, lines=True, chunksize=chunksize)
-            else:
-                if verbose:
-                    print("Detected standard JSON format (array/object)")
-                # For standard JSON, we need to read the whole file and chunk it manually
-                if concatenate:
-                    # Read entire JSON file
-                    with open(file_path, 'r') as f:
-                        data = json.load(f)
-
-                    # Convert to DataFrame based on structure
-                    if isinstance(data, list):
-                        df = pd.DataFrame(data)
-                        if verbose:
-                            print(f"Read JSON array with {len(df)} rows")
-                        return df
-                    elif isinstance(data, dict):
-                        # If it's a single object, create DataFrame with one row
-                        if any(isinstance(v, (list, dict)) for v in data.values()):
-                            # Complex nested structure - normalize it
-                            df = pd.json_normalize(data)
-                        else:
-                            df = pd.DataFrame([data])
-                        if verbose:
-                            print(f"Read JSON object, created DataFrame with {len(df)} rows")
-                        return df
-                    else:
-                        raise ValueError(f"Unsupported JSON structure: {type(data)}")
-                else:
-                    # For chunking standard JSON, we need to implement custom logic
-                    raise NotImplementedError(
-                        "Chunked reading not supported for standard JSON format. "
-                        "Use concatenate=True or convert to JSONL format."
-                    )
-
-    except Exception as e:
-        if verbose:
-            print(f"Error reading file: {e}")
-        raise
-
-    if concatenate:
-        try:
-            chunks = []
-            total_rows = 0
-            for i, chunk in enumerate(reader):
-                chunks.append(chunk)
-                total_rows += len(chunk)
-                if verbose:
-                    print(f"Processed chunk {i + 1} with {len(chunk)} rows (total: {total_rows})")
-
-            if not chunks:
-                if verbose:
-                    print("Warning: No data chunks were read")
-                return pd.DataFrame()
-
-            if verbose:
-                print(f"Concatenating {len(chunks)} chunks...")
-            result = pd.concat(chunks, ignore_index=True)
-
-            if verbose:
-                print(f"Finished reading. Total rows: {len(result)}")
-            return result
-
-        except MemoryError:
-            raise MemoryError("File too large to concatenate - try with concatenate=False")
-
-    else:
-        def chunk_generator():
-            total_rows = 0
-            for i, chunk in enumerate(reader):
-                if verbose:
-                    print(f"Yielding chunk {i + 1} with {len(chunk)} rows")
-                total_rows += len(chunk)
-                yield chunk
-
-            if verbose:
-                print(f"Finished reading. Total rows: {total_rows}")
-
-        return chunk_generator()
 def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
     """
     Save DataFrame list with automatic variable name detection.
