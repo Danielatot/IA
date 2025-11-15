@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import logging
 import inspect
+import subprocess
 from typing import List, Union, Dict, Generator, Tuple, Callable
 
 
@@ -11,9 +12,6 @@ def check_and_pull_git_lfs():
     Check for Git LFS pointers and pull actual files if needed.
     Returns True if pull was attempted/successful, False otherwise.
     """
-    import os
-    import subprocess
-
     # Get the root directory of the git repository
     try:
         # Get the root directory of the git repo
@@ -1510,7 +1508,7 @@ def sum_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
         Processed DataFrame(s) with:
         - New column containing sum of values from input columns
     """
-	    return merge_columns(dataframes, columns, new_column_name, 'sum')
+    return merge_columns(dataframes, columns, new_column_name, 'sum')
 
 
 def filter_rows_by_value(
