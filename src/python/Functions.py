@@ -499,23 +499,62 @@ def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
 
 def describe_dataframes(df_list: List[pd.DataFrame],
                         list_names: List[str] = None,
-                        ja_kodas_column: str = 'ja_kodas') -> pd.DataFrame:
+                        key_columns: List[str] = None) -> pd.DataFrame:
     """
-    Describe features of data frames in a data frame list.
+    Generate comprehensive descriptive statistics for a list of DataFrames.
+
+    This function provides a detailed overview of multiple DataFrames including
+    dimensions, memory usage, data types, unique values, duplicates, and missing data.
+    Particularly useful for comparing multiple datasets during data exploration.
 
     Parameters:
     -----------
     df_list : List[pd.DataFrame]
-        List of pandas DataFrames to analyze
-    list_names : List[str], optional
-        Names for each DataFrame in the list. If None, uses 'df_0', 'df_1', etc.
-    ja_kodas_column : str, default 'ja_kodas'
-        Name of the column to check for duplicates
+        List of pandas DataFrames to analyze. Each DataFrame will be summarized.
+
+    list_names : List[str], optional, default: None
+        Descriptive names for each DataFrame in the list.
+        If None, automatic names 'df_0', 'df_1', etc. will be generated.
+
+    key_columns : List[str], optional, default: None
+        Specific columns to analyze in detail for duplicates and unique values.
+        Useful for analyzing primary keys or important identifier columns.
+        If provided, detailed statistics will be generated for each specified column.
 
     Returns:
     --------
     pd.DataFrame
-        Summary DataFrame with features for each input DataFrame
+        A summary DataFrame where each row represents one input DataFrame and columns
+        contain comprehensive descriptive statistics including:
+        - Basic dimensions (rows, columns, total cells)
+        - Memory usage
+        - Data type distribution
+        - Unique value analysis
+        - Duplicate analysis
+        - Missing value statistics
+        - Key column analysis (if key_columns provided)
+
+    Examples:
+    ---------
+    >>> # Basic usage with automatic naming
+    >>> summary = describe_dataframes([df1, df2, df3])
+    >>>
+    >>> # With custom names and key columns analysis
+    >>> summary = describe_dataframes(
+    ...     df_list=[customers_df, orders_df, products_df],
+    ...     list_names=['customers', 'orders', 'products'],
+    ...     key_columns=['customer_id', 'order_id', 'product_id']
+    ... )
+    >>>
+    >>> # Display the summary
+    >>> print(summary)
+
+    Notes:
+    ------
+    - Memory usage is calculated with deep=True for accurate memory estimation
+    - Duplicate analysis includes both exact row duplicates and column-specific duplicates
+    - Missing values are calculated as percentage of total cells in the DataFrame
+    - Key column analysis is only performed if key_columns parameter is provided
     """
 
     if list_names is None:
@@ -530,27 +569,6 @@ def describe_dataframes(df_list: List[pd.DataFrame],
         # Basic dimensions
         rows, cols = df.shape
 
-        # Duplicates analysis for ja_kodas column
-        ja_kodas_duplicates = 0
-        ja_kodas_total_duplicates = 0
-        ja_kodas_duplicate_rows = 0
-
-        if ja_kodas_column in df.columns:
-            duplicate_mask = df[ja_kodas_column].duplicated(keep=False)
-            ja_kodas_duplicates = df[ja_kodas_column].duplicated().sum()
-            ja_kodas_total_duplicates = duplicate_mask.sum()
-            ja_kodas_duplicate_rows = ja_kodas_total_duplicates - ja_kodas_duplicates
-
-            # Get duplicate value counts for more detailed analysis
-            value_counts = df[ja_kodas_column].value_counts()
-            duplicate_values = value_counts[value_counts > 1]
-            most_common_duplicate = duplicate_values.index[0] if len(duplicate_values) > 0 else None
-            most_common_count = duplicate_values.iloc[0] if len(duplicate_values) > 0 else 0
-
-        else:
-            most_common_duplicate = None
-            most_common_count = 0
-
         # Memory usage
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)  # MB
 
@@ -558,42 +576,130 @@ def describe_dataframes(df_list: List[pd.DataFrame],
         dtypes_count = df.dtypes.value_counts().to_dict()
         numeric_cols = df.select_dtypes(include=['number']).shape[1]
         categorical_cols = df.select_dtypes(include=['object', 'category']).shape[1]
+        datetime_cols = df.select_dtypes(include=['datetime64']).shape[1]
+        bool_cols = df.select_dtypes(include=['bool']).shape[1]
 
         # Missing values
         total_missing = df.isnull().sum().sum()
         missing_percentage = (total_missing / (rows * cols)) * 100 if (rows * cols) > 0 else 0
 
-        summary_data.append({
+        # Unique values analysis
+        total_unique_values = df.nunique().sum()
+        avg_unique_per_column = total_unique_values / cols if cols > 0 else 0
+
+        # Column with most unique values
+        unique_counts = df.nunique()
+        most_unique_column = unique_counts.idxmax() if len(unique_counts) > 0 else None
+        most_unique_count = unique_counts.max() if len(unique_counts) > 0 else 0
+
+        # Column with least unique values (excluding constant columns)
+        non_constant_unique = unique_counts[unique_counts > 1]
+        least_unique_column = non_constant_unique.idxmin() if len(non_constant_unique) > 0 else None
+        least_unique_count = non_constant_unique.min() if len(non_constant_unique) > 0 else 0
+
+        # Duplicate rows analysis
+        duplicate_rows = df.duplicated().sum()
+        duplicate_row_percentage = (duplicate_rows / rows) * 100 if rows > 0 else 0
+
+        # Key columns analysis (if specified)
+        key_columns_analysis = {}
+        if key_columns:
+            for key_col in key_columns:
+                if key_col in df.columns:
+                    col_duplicates = df[key_col].duplicated().sum()
+                    col_total_duplicates = df[key_col].duplicated(keep=False).sum()
+                    col_unique_count = df[key_col].nunique()
+
+                    key_columns_analysis[f'{key_col}_duplicates'] = col_duplicates
+                    key_columns_analysis[f'{key_col}_total_duplicate_rows'] = col_total_duplicates
+                    key_columns_analysis[f'{key_col}_unique_count'] = col_unique_count
+                    key_columns_analysis[f'{key_col}_duplicate_percentage'] = round((col_duplicates / rows) * 100,
+                                                                                    2) if rows > 0 else 0
+                else:
+                    key_columns_analysis[f'{key_col}_exists'] = False
+
+        # Statistical summary for numeric columns
+        numeric_summary = df.describe(include='number') if numeric_cols > 0 else None
+        has_negative = (df.select_dtypes(include=['number']) < 0).any().any() if numeric_cols > 0 else False
+        has_zero = (df.select_dtypes(include=['number']) == 0).any().any() if numeric_cols > 0 else False
+
+        # Create comprehensive summary entry
+        summary_entry = {
+            # Basic information
             'dataframe_name': name,
             'rows': rows,
             'columns': cols,
             'total_cells': rows * cols,
             'memory_mb': round(memory_mb, 2),
-            'ja_kodas_duplicates': ja_kodas_duplicates,
-            'ja_kodas_total_duplicate_rows': ja_kodas_total_duplicates,
-            'ja_kodas_unique_duplicate_values': ja_kodas_duplicate_rows,
-            'ja_kodas_duplicate_percentage': round((ja_kodas_duplicates / rows) * 100, 2) if rows > 0 else 0,
-            'ja_kodas_most_common_duplicate': most_common_duplicate,
-            'ja_kodas_most_common_count': most_common_count,
-            'ja_kodas_column_exists': ja_kodas_column in df.columns,
-            'total_missing_values': total_missing,
-            'missing_percentage': round(missing_percentage, 2),
+
+            # Data type information
             'numeric_columns': numeric_cols,
             'categorical_columns': categorical_cols,
-            'unique_dtypes': len(dtypes_count)
-        })
+            'datetime_columns': datetime_cols,
+            'boolean_columns': bool_cols,
+            'unique_dtypes': len(dtypes_count),
+
+            # Unique values analysis
+            'total_unique_values': total_unique_values,
+            'avg_unique_per_column': round(avg_unique_per_column, 2),
+            'most_unique_column': most_unique_column,
+            'most_unique_count': most_unique_count,
+            'least_unique_column': least_unique_column,
+            'least_unique_count': least_unique_count,
+
+            # Duplicate analysis
+            'duplicate_rows': duplicate_rows,
+            'duplicate_row_percentage': round(duplicate_row_percentage, 2),
+
+            # Missing values analysis
+            'total_missing_values': total_missing,
+            'missing_percentage': round(missing_percentage, 2),
+
+            # Numeric data characteristics
+            'has_negative_values': has_negative,
+            'has_zero_values': has_zero,
+        }
+
+        # Add key columns analysis if available
+        summary_entry.update(key_columns_analysis)
+
+        summary_data.append(summary_entry)
 
     summary_df = pd.DataFrame(summary_data)
 
-    # Set display order for columns
+    # Define comprehensive column order for better readability
     column_order = [
+        # Basic information
         'dataframe_name', 'rows', 'columns', 'total_cells', 'memory_mb',
-        'ja_kodas_column_exists', 'ja_kodas_duplicates',
-        'ja_kodas_total_duplicate_rows', 'ja_kodas_unique_duplicate_values',
-        'ja_kodas_duplicate_percentage', 'ja_kodas_most_common_duplicate',
-        'ja_kodas_most_common_count', 'total_missing_values', 'missing_percentage',
-        'numeric_columns', 'categorical_columns', 'unique_dtypes'
+
+        # Data types
+        'numeric_columns', 'categorical_columns', 'datetime_columns',
+        'boolean_columns', 'unique_dtypes',
+
+        # Unique values
+        'total_unique_values', 'avg_unique_per_column',
+        'most_unique_column', 'most_unique_count',
+        'least_unique_column', 'least_unique_count',
+
+        # Duplicates
+        'duplicate_rows', 'duplicate_row_percentage',
+
+        # Missing values
+        'total_missing_values', 'missing_percentage',
+
+        # Numeric characteristics
+        'has_negative_values', 'has_zero_values',
     ]
+
+    # Add key columns metrics if they exist
+    if key_columns:
+        for key_col in key_columns:
+            column_order.extend([
+                f'{key_col}_unique_count',
+                f'{key_col}_duplicates',
+                f'{key_col}_total_duplicate_rows',
+                f'{key_col}_duplicate_percentage'
+            ])
 
     # Only include columns that exist in the summary
     column_order = [col for col in column_order if col in summary_df.columns]

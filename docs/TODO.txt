@@ -1,0 +1,13 @@
+JAR FA RODIKLIAI BLNS 2023: 2022-01–01 iki 2022-12-31, reg date 2023
+JAR FA RODIKLIAI BLNS 2024: 2023-01–01 iki 2023-12-31, reg date 2024
+JAR FA RODIKLIAI BLNS 2025: 2024-01–01 iki 2024-12-31, reg date 2025
+JAR FA RODIKLIAI BLNS 2020: 2019-01–01 iki 2019-12-31, reg date 2020
+JAR FA RODIKLIAI BLNS 2021: 2020-01–01 iki 2020-12-31, reg date 2021
+JAR FA RODIKLIAI BLNS 2022: 2021-01–01 iki 2021-12-31, reg date 2022
+
+Kas padaryta:
+
+1. Pašalinti nereikalingi string reiksmiu stulpeliai,
+2. Pivotinti stulpeliai paliekant visas kitas reiksmes vienodas.
+3. Išimtos eilutės su senesne reg_date reikia, reikia perdaryti, nes yra kitų metų ataskaitinių duomenų.
+
