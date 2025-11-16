@@ -7,90 +7,16 @@ import subprocess
 from typing import List, Union, Dict, Generator, Tuple, Callable, Any
 
 
-def check_and_pull_git_lfs():
-    """
-    Check for Git LFS pointers and pull actual files if needed.
-    Returns True if pull was attempted/successful, False otherwise.
-    """
-    # Get the root directory of the git repository
-    try:
-        # Get the root directory of the git repo
-        result = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
-                                capture_output=True, text=True, check=True)
-        repo_root = result.stdout.strip()
-
-        if not repo_root:
-            print("Not in a git repository")
-            return False
-
-        print(f"Git repository root: {repo_root}")
-
-        # Get current directory for context
-        current_dir = os.getcwd()
-        print(f"Current working directory: {current_dir}")
-
-        # Check if we're already in the repo root
-        if current_dir != repo_root:
-            print(f"Note: Switching to repository root for LFS operations")
-
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Git not available or not in a git repository")
-        return False
-
-    # Check if LFS is installed
-    try:
-        lfs_version_result = subprocess.run(['git', 'lfs', 'version'],
-                                            capture_output=True, text=True, check=True)
-        print(f"Git LFS version: {lfs_version_result.stdout.strip()}")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Git LFS is not installed. Please install Git LFS first.")
-        return False
-
-    # Check if there are LFS files that need pulling
-    try:
-        print("Checking LFS status in repository root...")
-        lfs_status = subprocess.run(['git', 'lfs', 'status'],
-                                    capture_output=True, text=True, check=True,
-                                    cwd=repo_root)
-
-        print("LFS Status Output:")
-        print(lfs_status.stdout)
-
-        if "to be downloaded" in lfs_status.stdout:
-            print("\nGit LFS files need downloading. Running 'git lfs pull' from repository root...")
-
-            # Actually pull the LFS files from repository root
-            pull_result = subprocess.run(['git', 'lfs', 'pull'],
-                                         capture_output=True, text=True, check=True,
-                                         cwd=repo_root)
-
-            print("Git LFS pull completed successfully!")
-            print(f"Pull output: {pull_result.stdout}")
-
-            # Verify the pull worked by checking status again
-            verify_status = subprocess.run(['git', 'lfs', 'status'],
-                                           capture_output=True, text=True, check=True,
-                                           cwd=repo_root)
-            print("Post-pull LFS status:")
-            print(verify_status.stdout)
-
-            return True
-        else:
-            print("No Git LFS files need downloading")
-            return False
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error during LFS operation: {e}")
-        if e.stderr:
-            print(f"Error details: {e.stderr}")
-        return False
-
 def read_large_file(file_path: str,
                     file_type: str = 'csv',
                     chunksize: int = 10000,
                     verbose: bool = True,
                     concatenate: bool = True,
-                    auto_handle_lfs: bool = False) -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
+                    auto_handle_lfs: bool = False,
+                    delimiter: str = 'auto',
+                    error_bad_lines: bool = True,
+                    on_bad_lines: str = 'error',
+                    encoding: str = 'utf-8') -> Union[Generator[pd.DataFrame, None, None], pd.DataFrame]:
     """
     Read large JSON or CSV file in chunks to avoid memory issues.
 
@@ -114,35 +40,267 @@ def read_large_file(file_path: str,
     :param auto_handle_lfs: If True, automatically tries to pull Git LFS files when detected (default: False)
     :type auto_handle_lfs: bool
 
+    :param delimiter: CSV delimiter character. Use 'auto' for automatic detection (default: 'auto')
+    :type delimiter: str
+
+    :param error_bad_lines: If True, raise exception on bad CSV lines (default: True)
+    :type error_bad_lines: bool
+
+    :param on_bad_lines: How to handle bad CSV lines: 'error', 'warn', 'skip' (default: 'error')
+    :type on_bad_lines: str
+
+    :param encoding: File encoding to use (default: 'utf-8')
+    :type encoding: str
+
     Returns:
     --------
     Union[Generator[pd.DataFrame, None, None], pd.DataFrame]
         - If concatenate=False: Generator yielding DataFrames for each chunk
         - If concatenate=True: Single DataFrame with all data
+
+    Raises:
+    -------
+    ValueError: If file_type is not 'csv' or 'json'
+    FileNotFoundError: If file_path doesn't exist
+    pd.errors.ParserError: If CSV parsing fails and error_bad_lines=True
     """
     import os
     import pandas as pd
     import json
+    import subprocess
     from typing import Union, Generator
+
+    # Git LFS Detection Function
+    def is_git_lfs_pointer(file_path: str) -> bool:
+        """Check if a file is a Git LFS pointer file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                first_line = f.readline().strip()
+                return first_line.startswith('version https://git-lfs.github.com/spec/v1')
+        except (UnicodeDecodeError, IOError):
+            return False
+
+    def handle_git_lfs_file(file_path: str) -> bool:
+        """Handle Git LFS pointer file by pulling actual content."""
+        if verbose:
+            print("Git LFS pointer detected. Attempting to pull actual file...")
+
+        try:
+            # Get repository root
+            repo_result = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                                         capture_output=True, text=True, check=True)
+            repo_root = repo_result.stdout.strip()
+
+            if verbose:
+                print(f"Repository root: {repo_root}")
+
+            # Check if LFS is installed
+            subprocess.run(['git', 'lfs', 'version'], capture_output=True, check=True)
+
+            # Pull LFS files
+            if verbose:
+                print("Running 'git lfs pull'...")
+
+            pull_result = subprocess.run(['git', 'lfs', 'pull'],
+                                         capture_output=True, text=True, check=True,
+                                         cwd=repo_root)
+
+            if verbose:
+                print("Git LFS pull completed successfully")
+                if pull_result.stdout:
+                    print(f"Pull output: {pull_result.stdout}")
+
+            # Verify the file is no longer a pointer
+            if not is_git_lfs_pointer(file_path):
+                if verbose:
+                    print("Git LFS file successfully downloaded")
+                return True
+            else:
+                if verbose:
+                    print("File is still a Git LFS pointer after pull")
+                return False
+
+        except subprocess.CalledProcessError as e:
+            if verbose:
+                print(f"Git LFS operation failed: {e}")
+                if e.stderr:
+                    print(f"Error details: {e.stderr}")
+            return False
+        except FileNotFoundError:
+            if verbose:
+                print("Git not found in PATH")
+            return False
 
     # Validate file type parameter
     if file_type not in ['csv', 'json']:
         raise ValueError("file_type must be either 'csv' or 'json'")
 
+    # Validate on_bad_lines parameter
+    if on_bad_lines not in ['error', 'warn', 'skip']:
+        raise ValueError("on_bad_lines must be 'error', 'warn', or 'skip'")
+
     # Enhanced file validation
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found at path: {file_path}")
+
+    # Git LFS handling
+    if is_git_lfs_pointer(file_path):
+        if auto_handle_lfs:
+            success = handle_git_lfs_file(file_path)
+            if not success:
+                raise IOError(
+                    f"Failed to automatically handle Git LFS file: {file_path}\n"
+                    f"Please run 'git lfs pull' manually or check Git LFS configuration."
+                )
+        else:
+            raise IOError(
+                f"File is a Git LFS pointer: {file_path}\n"
+                f"Set auto_handle_lfs=True to automatically download, or run 'git lfs pull' manually."
+            )
 
     if verbose:
         print(f"Reading {file_type.upper()} file from: {file_path}")
         print(f"File size: {os.path.getsize(file_path) / 1024 / 1024:.2f} MB")
 
+    def detect_csv_delimiter(file_path: str, sample_lines: int = 20, encoding: str = 'utf-8') -> str:
+        """
+        Detect the delimiter used in a CSV file.
+
+        Parameters:
+        -----------
+        file_path: Path to the CSV file
+        sample_lines: Number of lines to sample for detection
+        encoding: File encoding
+
+        Returns:
+        --------
+        str: Detected delimiter character
+        """
+        import csv
+
+        # Common delimiters to check (ordered by likelihood)
+        delimiters = [',', '\t', ';', '|', ':']
+        delimiter_counts = {delim: [] for delim in delimiters}  # Store counts per line
+
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                lines_read = 0
+                for i, line in enumerate(f):
+                    if i >= sample_lines:
+                        break
+                    if line.strip():  # Skip empty lines
+                        lines_read += 1
+                        for delim in delimiters:
+                            count = line.count(delim)
+                            delimiter_counts[delim].append(count)
+
+                if lines_read == 0:
+                    if verbose:
+                        print("Warning: File appears to be empty or contains only empty lines")
+                    return ','  # Default to comma
+
+            # Analyze the results
+            delimiter_scores = {}
+
+            for delim, counts in delimiter_counts.items():
+                if not counts:  # No data for this delimiter
+                    continue
+
+                # Calculate score based on:
+                # 1. Average count per line (higher is better)
+                # 2. Consistency across lines (lower std dev is better)
+                # 3. Non-zero counts (we want delimiters that appear in most lines)
+                avg_count = sum(counts) / len(counts)
+                non_zero_lines = sum(1 for c in counts if c > 0)
+                consistency_score = non_zero_lines / len(counts)
+
+                # Penalize delimiters that appear inconsistently
+                if avg_count > 0 and consistency_score > 0.5:
+                    # Base score on average count, weighted by consistency
+                    delimiter_scores[delim] = avg_count * consistency_score
+
+            if not delimiter_scores:
+                if verbose:
+                    print("Warning: Could not detect delimiter reliably, defaulting to comma")
+                return ','
+
+            # Get the delimiter with the highest score
+            detected_delimiter = max(delimiter_scores, key=delimiter_scores.get)
+            highest_score = delimiter_scores[detected_delimiter]
+
+            if verbose:
+                print(f"Delimiter detection scores: {delimiter_scores}")
+                print(f"Detected delimiter: '{detected_delimiter}' (score: {highest_score:.2f})")
+
+            return detected_delimiter
+
+        except UnicodeDecodeError as e:
+            if verbose:
+                print(f"Encoding error during delimiter detection: {e}")
+                print("Trying common alternative encodings...")
+
+            # Try common alternative encodings
+            alternative_encodings = ['latin-1', 'iso-8859-1', 'cp1252', 'utf-16']
+            for alt_encoding in alternative_encodings:
+                try:
+                    if verbose:
+                        print(f"Trying encoding: {alt_encoding}")
+                    return detect_csv_delimiter(file_path, sample_lines, alt_encoding)
+                except UnicodeDecodeError:
+                    continue
+
+            if verbose:
+                print("Could not detect delimiter with any encoding, defaulting to comma")
+            return ','
+
+        except Exception as e:
+            if verbose:
+                print(f"Error during delimiter detection: {e}")
+            return ','  # Default fallback
+
     try:
         if file_type == 'csv':
-            reader = pd.read_csv(file_path, chunksize=chunksize)
+            # Handle delimiter detection
+            final_delimiter = delimiter
+            if delimiter == 'auto':
+                if verbose:
+                    print("Auto-detecting CSV delimiter...")
+                final_delimiter = detect_csv_delimiter(file_path, encoding=encoding)
+            else:
+                if verbose:
+                    print(f"Using specified delimiter: '{delimiter}'")
+
+            if verbose:
+                print(f"Bad lines handling: {on_bad_lines}")
+                print(f"File encoding: {encoding}")
+
+            # Handle different pandas versions for error handling
+            read_csv_kwargs = {
+                'filepath_or_buffer': file_path,
+                'chunksize': chunksize,
+                'delimiter': final_delimiter,
+                'on_bad_lines': on_bad_lines,
+                'encoding': encoding,
+            }
+
+            # For older pandas versions that use error_bad_lines
+            try:
+                reader = pd.read_csv(**read_csv_kwargs)
+            except TypeError as e:
+                if "unexpected keyword argument 'on_bad_lines'" in str(e):
+                    if verbose:
+                        print("Using legacy error_bad_lines parameter for older pandas version")
+                    # Fall back to error_bad_lines for older pandas
+                    read_csv_kwargs.pop('on_bad_lines')
+                    read_csv_kwargs['error_bad_lines'] = error_bad_lines
+                    read_csv_kwargs['warn_bad_lines'] = (on_bad_lines == 'warn')
+                    reader = pd.read_csv(**read_csv_kwargs)
+                else:
+                    raise
+
         else:  # json
             # First, detect the JSON format
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding=encoding) as f:
                 first_line = f.readline().strip()
                 second_line = f.readline().strip() if first_line else ""
 
@@ -166,14 +324,14 @@ def read_large_file(file_path: str,
             if is_jsonl:
                 if verbose:
                     print("Detected JSONL format (line-delimited JSON)")
-                reader = pd.read_json(file_path, lines=True, chunksize=chunksize)
+                reader = pd.read_json(file_path, lines=True, chunksize=chunksize, encoding=encoding)
             else:
                 if verbose:
                     print("Detected standard JSON format (array/object)")
                 # For standard JSON, we need to read the whole file and chunk it manually
                 if concatenate:
                     # Read entire JSON file
-                    with open(file_path, 'r') as f:
+                    with open(file_path, 'r', encoding=encoding) as f:
                         data = json.load(f)
 
                     # Convert to DataFrame based on structure
@@ -201,6 +359,37 @@ def read_large_file(file_path: str,
                         "Use concatenate=True or convert to JSONL format."
                     )
 
+    except pd.errors.ParserError as e:
+        if verbose:
+            print(f"CSV parsing error: {e}")
+            print("This often occurs due to:")
+            print("1. Inconsistent number of fields across rows")
+            print("2. Incorrect delimiter")
+            print("3. Unescaped quotes or special characters")
+            print("4. Mixed data types in columns")
+
+        # Provide helpful suggestions
+        suggestions = []
+        if "Expected" in str(e) and "saw" in str(e):
+            suggestions.append("Try using a different delimiter with the 'delimiter' parameter")
+            suggestions.append("Try setting on_bad_lines='warn' or 'skip' to ignore problematic lines")
+            suggestions.append("Check the specific line mentioned in the error for formatting issues")
+            suggestions.append("Try specifying encoding if file contains special characters")
+
+        if suggestions:
+            print("Suggestions to fix:")
+            for suggestion in suggestions:
+                print(f"  - {suggestion}")
+
+        raise
+
+    except UnicodeDecodeError as e:
+        if verbose:
+            print(f"Encoding error: {e}")
+            print("Try specifying a different encoding parameter")
+            print("Common encodings: 'latin-1', 'iso-8859-1', 'cp1252', 'utf-16'")
+        raise
+
     except Exception as e:
         if verbose:
             print(f"Error reading file: {e}")
@@ -210,6 +399,8 @@ def read_large_file(file_path: str,
         try:
             chunks = []
             total_rows = 0
+            bad_lines_count = 0
+
             for i, chunk in enumerate(reader):
                 chunks.append(chunk)
                 total_rows += len(chunk)
@@ -227,6 +418,9 @@ def read_large_file(file_path: str,
 
             if verbose:
                 print(f"Finished reading. Total rows: {len(result)}")
+                if bad_lines_count > 0:
+                    print(f"Warning: {bad_lines_count} bad lines were skipped")
+
             return result
 
         except MemoryError:
@@ -235,6 +429,8 @@ def read_large_file(file_path: str,
     else:
         def chunk_generator():
             total_rows = 0
+            bad_lines_count = 0
+
             for i, chunk in enumerate(reader):
                 if verbose:
                     print(f"Yielding chunk {i + 1} with {len(chunk)} rows")
@@ -243,8 +439,114 @@ def read_large_file(file_path: str,
 
             if verbose:
                 print(f"Finished reading. Total rows: {total_rows}")
+                if bad_lines_count > 0:
+                    print(f"Warning: {bad_lines_count} bad lines were skipped")
 
         return chunk_generator()
+
+
+def check_and_pull_git_lfs(directory_path: str = None):
+    """
+    Check for Git LFS pointers and pull actual files if needed.
+
+    Parameters:
+    -----------
+    directory_path : str, optional
+        Specific directory path to run Git LFS operations from.
+        If None, uses the current working directory or git repository root.
+
+    Returns:
+    --------
+    bool
+        True if pull was attempted/successful, False otherwise.
+    """
+    import os
+    import subprocess
+
+    # Determine the target directory for Git operations
+    if directory_path is not None:
+        # Use the specified directory
+        target_dir = os.path.abspath(directory_path)
+        if not os.path.exists(target_dir):
+            print(f"Specified directory does not exist: {target_dir}")
+            return False
+        if not os.path.isdir(target_dir):
+            print(f"Specified path is not a directory: {target_dir}")
+            return False
+    else:
+        # Use git repository root or current directory
+        try:
+            # Get the root directory of the git repo
+            result = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                                    capture_output=True, text=True, check=True)
+            target_dir = result.stdout.strip()
+            if not target_dir:
+                print("Not in a git repository")
+                return False
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fall back to current directory if not in git repo
+            target_dir = os.getcwd()
+            print(f"Not in a git repository, using current directory: {target_dir}")
+
+    # Get current directory for context
+    current_dir = os.getcwd()
+    print(f"Target directory for LFS operations: {target_dir}")
+    print(f"Current working directory: {current_dir}")
+
+    # Check if we need to change directories
+    using_different_dir = current_dir != target_dir
+    if using_different_dir:
+        print(f"Note: Using specified directory for LFS operations")
+
+    # Check if LFS is installed
+    try:
+        lfs_version_result = subprocess.run(['git', 'lfs', 'version'],
+                                            capture_output=True, text=True, check=True,
+                                            cwd=target_dir)
+        print(f"Git LFS version: {lfs_version_result.stdout.strip()}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Git LFS is not installed. Please install Git LFS first.")
+        return False
+
+    # Check if there are LFS files that need pulling
+    try:
+        print(f"Checking LFS status in target directory...")
+        lfs_status = subprocess.run(['git', 'lfs', 'status'],
+                                    capture_output=True, text=True, check=True,
+                                    cwd=target_dir)
+
+        print("LFS Status Output:")
+        print(lfs_status.stdout)
+
+        if "to be downloaded" in lfs_status.stdout:
+            print(f"\nGit LFS files need downloading. Running 'git lfs pull' from target directory...")
+
+            # Actually pull the LFS files from target directory
+            pull_result = subprocess.run(['git', 'lfs', 'pull'],
+                                         capture_output=True, text=True, check=True,
+                                         cwd=target_dir)
+
+            print("Git LFS pull completed successfully!")
+            if pull_result.stdout:
+                print(f"Pull output: {pull_result.stdout}")
+
+            # Verify the pull worked by checking status again
+            verify_status = subprocess.run(['git', 'lfs', 'status'],
+                                           capture_output=True, text=True, check=True,
+                                           cwd=target_dir)
+            print("Post-pull LFS status:")
+            print(verify_status.stdout)
+
+            return True
+        else:
+            print("No Git LFS files need downloading")
+            return False
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error during LFS operation: {e}")
+        if e.stderr:
+            print(f"Error details: {e.stderr}")
+        return False
 def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
     """
     Save DataFrame list with automatic variable name detection.
@@ -301,23 +603,62 @@ def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
 
 def describe_dataframes(df_list: List[pd.DataFrame],
                         list_names: List[str] = None,
-                        ja_kodas_column: str = 'ja_kodas') -> pd.DataFrame:
+                        key_columns: List[str] = None) -> pd.DataFrame:
     """
-    Describe features of data frames in a data frame list.
+    Generate comprehensive descriptive statistics for a list of DataFrames.
+
+    This function provides a detailed overview of multiple DataFrames including
+    dimensions, memory usage, data types, unique values, duplicates, and missing data.
+    Particularly useful for comparing multiple datasets during data exploration.
 
     Parameters:
     -----------
     df_list : List[pd.DataFrame]
-        List of pandas DataFrames to analyze
-    list_names : List[str], optional
-        Names for each DataFrame in the list. If None, uses 'df_0', 'df_1', etc.
-    ja_kodas_column : str, default 'ja_kodas'
-        Name of the column to check for duplicates
+        List of pandas DataFrames to analyze. Each DataFrame will be summarized.
+
+    list_names : List[str], optional, default: None
+        Descriptive names for each DataFrame in the list.
+        If None, automatic names 'df_0', 'df_1', etc. will be generated.
+
+    key_columns : List[str], optional, default: None
+        Specific columns to analyze in detail for duplicates and unique values.
+        Useful for analyzing primary keys or important identifier columns.
+        If provided, detailed statistics will be generated for each specified column.
 
     Returns:
     --------
     pd.DataFrame
-        Summary DataFrame with features for each input DataFrame
+        A summary DataFrame where each row represents one input DataFrame and columns
+        contain comprehensive descriptive statistics including:
+        - Basic dimensions (rows, columns, total cells)
+        - Memory usage
+        - Data type distribution
+        - Unique value analysis
+        - Duplicate analysis
+        - Missing value statistics
+        - Key column analysis (if key_columns provided)
+
+    Examples:
+    ---------
+    >>> # Basic usage with automatic naming
+    >>> summary = describe_dataframes([df1, df2, df3])
+    >>>
+    >>> # With custom names and key columns analysis
+    >>> summary = describe_dataframes(
+    ...     df_list=[customers_df, orders_df, products_df],
+    ...     list_names=['customers', 'orders', 'products'],
+    ...     key_columns=['customer_id', 'order_id', 'product_id']
+    ... )
+    >>>
+    >>> # Display the summary
+    >>> print(summary)
+
+    Notes:
+    ------
+    - Memory usage is calculated with deep=True for accurate memory estimation
+    - Duplicate analysis includes both exact row duplicates and column-specific duplicates
+    - Missing values are calculated as percentage of total cells in the DataFrame
+    - Key column analysis is only performed if key_columns parameter is provided
     """
 
     if list_names is None:
@@ -332,27 +673,6 @@ def describe_dataframes(df_list: List[pd.DataFrame],
         # Basic dimensions
         rows, cols = df.shape
 
-        # Duplicates analysis for ja_kodas column
-        ja_kodas_duplicates = 0
-        ja_kodas_total_duplicates = 0
-        ja_kodas_duplicate_rows = 0
-
-        if ja_kodas_column in df.columns:
-            duplicate_mask = df[ja_kodas_column].duplicated(keep=False)
-            ja_kodas_duplicates = df[ja_kodas_column].duplicated().sum()
-            ja_kodas_total_duplicates = duplicate_mask.sum()
-            ja_kodas_duplicate_rows = ja_kodas_total_duplicates - ja_kodas_duplicates
-
-            # Get duplicate value counts for more detailed analysis
-            value_counts = df[ja_kodas_column].value_counts()
-            duplicate_values = value_counts[value_counts > 1]
-            most_common_duplicate = duplicate_values.index[0] if len(duplicate_values) > 0 else None
-            most_common_count = duplicate_values.iloc[0] if len(duplicate_values) > 0 else 0
-
-        else:
-            most_common_duplicate = None
-            most_common_count = 0
-
         # Memory usage
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)  # MB
 
@@ -360,42 +680,130 @@ def describe_dataframes(df_list: List[pd.DataFrame],
         dtypes_count = df.dtypes.value_counts().to_dict()
         numeric_cols = df.select_dtypes(include=['number']).shape[1]
         categorical_cols = df.select_dtypes(include=['object', 'category']).shape[1]
+        datetime_cols = df.select_dtypes(include=['datetime64']).shape[1]
+        bool_cols = df.select_dtypes(include=['bool']).shape[1]
 
         # Missing values
         total_missing = df.isnull().sum().sum()
         missing_percentage = (total_missing / (rows * cols)) * 100 if (rows * cols) > 0 else 0
 
-        summary_data.append({
+        # Unique values analysis
+        total_unique_values = df.nunique().sum()
+        avg_unique_per_column = total_unique_values / cols if cols > 0 else 0
+
+        # Column with most unique values
+        unique_counts = df.nunique()
+        most_unique_column = unique_counts.idxmax() if len(unique_counts) > 0 else None
+        most_unique_count = unique_counts.max() if len(unique_counts) > 0 else 0
+
+        # Column with least unique values (excluding constant columns)
+        non_constant_unique = unique_counts[unique_counts > 1]
+        least_unique_column = non_constant_unique.idxmin() if len(non_constant_unique) > 0 else None
+        least_unique_count = non_constant_unique.min() if len(non_constant_unique) > 0 else 0
+
+        # Duplicate rows analysis
+        duplicate_rows = df.duplicated().sum()
+        duplicate_row_percentage = (duplicate_rows / rows) * 100 if rows > 0 else 0
+
+        # Key columns analysis (if specified)
+        key_columns_analysis = {}
+        if key_columns:
+            for key_col in key_columns:
+                if key_col in df.columns:
+                    col_duplicates = df[key_col].duplicated().sum()
+                    col_total_duplicates = df[key_col].duplicated(keep=False).sum()
+                    col_unique_count = df[key_col].nunique()
+
+                    key_columns_analysis[f'{key_col}_duplicates'] = col_duplicates
+                    key_columns_analysis[f'{key_col}_total_duplicate_rows'] = col_total_duplicates
+                    key_columns_analysis[f'{key_col}_unique_count'] = col_unique_count
+                    key_columns_analysis[f'{key_col}_duplicate_percentage'] = round((col_duplicates / rows) * 100,
+                                                                                    2) if rows > 0 else 0
+                else:
+                    key_columns_analysis[f'{key_col}_exists'] = False
+
+        # Statistical summary for numeric columns
+        numeric_summary = df.describe(include='number') if numeric_cols > 0 else None
+        has_negative = (df.select_dtypes(include=['number']) < 0).any().any() if numeric_cols > 0 else False
+        has_zero = (df.select_dtypes(include=['number']) == 0).any().any() if numeric_cols > 0 else False
+
+        # Create comprehensive summary entry
+        summary_entry = {
+            # Basic information
             'dataframe_name': name,
             'rows': rows,
             'columns': cols,
             'total_cells': rows * cols,
             'memory_mb': round(memory_mb, 2),
-            'ja_kodas_duplicates': ja_kodas_duplicates,
-            'ja_kodas_total_duplicate_rows': ja_kodas_total_duplicates,
-            'ja_kodas_unique_duplicate_values': ja_kodas_duplicate_rows,
-            'ja_kodas_duplicate_percentage': round((ja_kodas_duplicates / rows) * 100, 2) if rows > 0 else 0,
-            'ja_kodas_most_common_duplicate': most_common_duplicate,
-            'ja_kodas_most_common_count': most_common_count,
-            'ja_kodas_column_exists': ja_kodas_column in df.columns,
-            'total_missing_values': total_missing,
-            'missing_percentage': round(missing_percentage, 2),
+
+            # Data type information
             'numeric_columns': numeric_cols,
             'categorical_columns': categorical_cols,
-            'unique_dtypes': len(dtypes_count)
-        })
+            'datetime_columns': datetime_cols,
+            'boolean_columns': bool_cols,
+            'unique_dtypes': len(dtypes_count),
+
+            # Unique values analysis
+            'total_unique_values': total_unique_values,
+            'avg_unique_per_column': round(avg_unique_per_column, 2),
+            'most_unique_column': most_unique_column,
+            'most_unique_count': most_unique_count,
+            'least_unique_column': least_unique_column,
+            'least_unique_count': least_unique_count,
+
+            # Duplicate analysis
+            'duplicate_rows': duplicate_rows,
+            'duplicate_row_percentage': round(duplicate_row_percentage, 2),
+
+            # Missing values analysis
+            'total_missing_values': total_missing,
+            'missing_percentage': round(missing_percentage, 2),
+
+            # Numeric data characteristics
+            'has_negative_values': has_negative,
+            'has_zero_values': has_zero,
+        }
+
+        # Add key columns analysis if available
+        summary_entry.update(key_columns_analysis)
+
+        summary_data.append(summary_entry)
 
     summary_df = pd.DataFrame(summary_data)
 
-    # Set display order for columns
+    # Define comprehensive column order for better readability
     column_order = [
+        # Basic information
         'dataframe_name', 'rows', 'columns', 'total_cells', 'memory_mb',
-        'ja_kodas_column_exists', 'ja_kodas_duplicates',
-        'ja_kodas_total_duplicate_rows', 'ja_kodas_unique_duplicate_values',
-        'ja_kodas_duplicate_percentage', 'ja_kodas_most_common_duplicate',
-        'ja_kodas_most_common_count', 'total_missing_values', 'missing_percentage',
-        'numeric_columns', 'categorical_columns', 'unique_dtypes'
+
+        # Data types
+        'numeric_columns', 'categorical_columns', 'datetime_columns',
+        'boolean_columns', 'unique_dtypes',
+
+        # Unique values
+        'total_unique_values', 'avg_unique_per_column',
+        'most_unique_column', 'most_unique_count',
+        'least_unique_column', 'least_unique_count',
+
+        # Duplicates
+        'duplicate_rows', 'duplicate_row_percentage',
+
+        # Missing values
+        'total_missing_values', 'missing_percentage',
+
+        # Numeric characteristics
+        'has_negative_values', 'has_zero_values',
     ]
+
+    # Add key columns metrics if they exist
+    if key_columns:
+        for key_col in key_columns:
+            column_order.extend([
+                f'{key_col}_unique_count',
+                f'{key_col}_duplicates',
+                f'{key_col}_total_duplicate_rows',
+                f'{key_col}_duplicate_percentage'
+            ])
 
     # Only include columns that exist in the summary
     column_order = [col for col in column_order if col in summary_df.columns]
@@ -517,9 +925,10 @@ def remove_columns(df_list: List[pd.DataFrame],
 
 
 def set_columns_to_datetime(data: Union[pd.DataFrame, List[pd.DataFrame]],
-                           datetime_columns: Union[str, List[str]],
-                           drop_columns: Union[str, List[str]] = None,
-                           verbose: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                            datetime_columns: Union[str, List[str]],
+                            drop_columns: Union[str, List[str]] = None,
+                            verbose: bool = True,
+                            inplace: bool = False) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
     Convert specified columns to datetime format in DataFrame(s) and optionally drop columns.
 
@@ -527,75 +936,125 @@ def set_columns_to_datetime(data: Union[pd.DataFrame, List[pd.DataFrame]],
     -----------
     :param data: Input DataFrame or list of DataFrames to process
     :type data: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param datetime_columns: Column name(s) to convert to datetime format
     :type datetime_columns: Union[str, List[str]]
-    
+
     :param drop_columns: Optional column name(s) to drop after conversion (default: None)
     :type drop_columns: Union[str, List[str]]
 
     :param verbose: Whether to print progress messages (default: True)
     :type verbose: bool
 
+    :param inplace: If True, modifies the original DataFrame(s) in place and returns None (default: False)
+    :type inplace: bool
+
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - Specified columns converted to datetime format (if they exist)
-        - Optional columns dropped if drop_columns was provided
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=False: New processed DataFrame(s)
+        - If inplace=True: None (original DataFrame(s) are modified in place)
     """
     # Convert parameters to lists if they are single values
     datetime_cols = [datetime_columns] if isinstance(datetime_columns, str) else datetime_columns
-    drop_cols = [drop_columns] if isinstance(drop_columns, str) else drop_columns if drop_columns else []
+    drop_cols = [drop_columns] if isinstance(drop_columns, str) else drop_cols if drop_columns else []
 
-    if isinstance(data, pd.DataFrame):
-        # Initialize counters
-        converted = 0
-        skipped = 0
-        dropped = 0
-        
-        # Process single DataFrame
-        for col in datetime_cols:
-            if col in data.columns:
-                data[col] = pd.to_datetime(data[col], errors='coerce')
-                converted += 1
-                if verbose:
-                    print(f"Converted column '{col}' to datetime")
-            else:
-                skipped += 1
-                if verbose:
-                    print(f"Column '{col}' not found - skipping")
-
-        # Handle column dropping
-        if drop_cols:
-            existing_drop_cols = [col for col in drop_cols if col in data.columns]
-            dropped = len(existing_drop_cols)
-            data.drop(columns=existing_drop_cols, inplace=True)
-            if verbose and existing_drop_cols:
-                print(f"Dropped columns: {existing_drop_cols}")
-
-        # Print summary
+    if inplace:
         if verbose:
-            print(f"\n📊 Processing Summary:")
-            print(f"   ✅ Converted {converted} columns to datetime")
-            print(f"   ⏭️  Skipped {skipped} columns (not found)")
-            print(f"   🗑️  Dropped {dropped} columns")
+            print("⚠️  INPLACE MODE: Modifying original DataFrame(s)")
 
-        return data
+        def process_single_df_inplace(df: pd.DataFrame) -> None:
+            """Process a single DataFrame in place"""
+            converted = 0
+            skipped = 0
 
-    elif isinstance(data, list):
-        # Process list of DataFrames
-        processed_dfs = []
-        for i, df in enumerate(data):
+            for col in datetime_cols:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                    converted += 1
+                    if verbose:
+                        print(f"Converted column '{col}' to datetime")
+                else:
+                    skipped += 1
+                    if verbose:
+                        print(f"Column '{col}' not found - skipping")
+
+            # Handle column dropping
+            dropped = 0
+            if drop_cols:
+                existing_drop_cols = [col for col in drop_cols if col in df.columns]
+                dropped = len(existing_drop_cols)
+                df.drop(columns=existing_drop_cols, inplace=True)
+                if verbose and existing_drop_cols:
+                    print(f"Dropped columns: {existing_drop_cols}")
+
+            # Print summary
             if verbose:
-                print(f"\nProcessing DataFrame {i}")
-            processed_df = set_columns_to_datetime(df, datetime_cols, drop_cols, verbose)
-            processed_dfs.append(processed_df)
-        return processed_dfs
+                print(f"📊 Inplace processing: Converted {converted}, Skipped {skipped}, Dropped {dropped}")
+
+        # Process data based on type
+        if isinstance(data, pd.DataFrame):
+            process_single_df_inplace(data)
+        elif isinstance(data, list):
+            for i, df in enumerate(data):
+                if verbose:
+                    print(f"\nProcessing DataFrame {i} in place")
+                process_single_df_inplace(df)
+        else:
+            raise ValueError("data must be a DataFrame or a list of DataFrames")
+
+        return None  # Inplace operations return None
 
     else:
-        raise ValueError("data must be a DataFrame or a list of DataFrames")
+        # NEW OBJECT MODE
+        if verbose:
+            print("🆕 NEW OBJECT MODE: Creating new DataFrame(s)")
 
+        def process_single_df_copy(df: pd.DataFrame) -> pd.DataFrame:
+            """Process a single DataFrame and return a new copy"""
+            df_copy = df.copy()
+            converted = 0
+            skipped = 0
+
+            for col in datetime_cols:
+                if col in df_copy.columns:
+                    df_copy[col] = pd.to_datetime(df_copy[col], errors='coerce')
+                    converted += 1
+                    if verbose:
+                        print(f"Converted column '{col}' to datetime")
+                else:
+                    skipped += 1
+                    if verbose:
+                        print(f"Column '{col}' not found - skipping")
+
+            # Handle column dropping
+            dropped = 0
+            if drop_cols:
+                existing_drop_cols = [col for col in drop_cols if col in df_copy.columns]
+                dropped = len(existing_drop_cols)
+                df_copy.drop(columns=existing_drop_cols, inplace=True)
+                if verbose and existing_drop_cols:
+                    print(f"Dropped columns: {existing_drop_cols}")
+
+            # Print summary
+            if verbose:
+                print(f"📊 New object processing: Converted {converted}, Skipped {skipped}, Dropped {dropped}")
+
+            return df_copy
+
+        # Process data based on type
+        if isinstance(data, pd.DataFrame):
+            return process_single_df_copy(data)
+        elif isinstance(data, list):
+            processed_dfs = []
+            for i, df in enumerate(data):
+                if verbose:
+                    print(f"\nProcessing DataFrame {i} as new object")
+                processed_df = process_single_df_copy(df)
+                processed_dfs.append(processed_df)
+            return processed_dfs
+        else:
+            raise ValueError("data must be a DataFrame or a list of DataFrames")
 
 def set_columns_to_numeric(data: Union[pd.DataFrame, List[pd.DataFrame]],
                          numeric_columns: Union[str, List[str]],
@@ -870,15 +1329,17 @@ def pivot_columns(data: Union[pd.DataFrame, List[pd.DataFrame]],
 
     return processed_dfs[0] if single_df else processed_dfs
 
+
 def pivot_dfs_smart(
-    dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
-    pivot_column: str = 'line_name',
-    value_column: str = 'reiksme',
-    id_columns: List[str] = ['ja_kodas'],
-    numeric_agg: str = 'first',
-    string_agg: str = 'first',
-    verbose: bool = True,
-    date_column: str = None
+        dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
+        pivot_column: str = 'line_name',
+        value_column: str = 'reiksme',
+        id_columns: List[str] = ['ja_kodas'],
+        numeric_agg: str = 'first',
+        string_agg: str = 'first',
+        verbose: bool = True,
+        date_column: str = None,
+        inplace: bool = False
 ) -> Union[pd.DataFrame, List[pd.DataFrame]]:
     """
     Apply pivot transformation with configurable aggregation and near-duplicate detection.
@@ -887,43 +1348,46 @@ def pivot_dfs_smart(
     -----------
     :param dataframes: Input DataFrame or list of DataFrames to process
     :type dataframes: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param pivot_column: Column containing values to pivot into new columns (default: 'line_name')
     :type pivot_column: str
-    
+
     :param value_column: Column containing values to spread (default: 'reiksme')
     :type value_column: str
-    
+
     :param id_columns: List of columns used to identify duplicates (default: ['ja_kodas'])
     :type id_columns: List[str]
-    
+
     :param numeric_agg: Aggregation method for numeric columns (default: 'first')
     :type numeric_agg: str
-    
+
     :param string_agg: Aggregation method for string columns (default: 'first')
     :type string_agg: str
 
     :param verbose: Whether to print progress messages (default: True)
     :type verbose: bool
 
+    :param date_column: Column containing date information for keeping most recent duplicates (default: None)
+    :type date_column: str
+
+    :param inplace: If True, modifies the original DataFrame(s) in place and returns None (default: False)
+    :type inplace: bool
+
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - Columns pivoted based on pivot_column values
-        - Configurable aggregation methods
-        - Original columns preserved except pivot and value columns
-        - Near-duplicates removed and reported
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=False: New processed DataFrame(s) with pivoted structure
+        - If inplace=True: None (original DataFrame(s) are modified in place)
     """
 
     def detect_duplicates(df: pd.DataFrame) -> Dict[str, Dict[str, List[Any]]]:
         """
         Detect duplicate rows where ja_kodas and line_name are identical but reiksme differs.
-        
+
         Duplicates are defined as rows with:
         - Exactly matching ja_kodas AND line_name values
         - Different reiksme values
-        
+
         Returns:
         --------
         Dict[str, Dict[str, List[Any]]]
@@ -935,13 +1399,13 @@ def pivot_dfs_smart(
               * 'count': Number of duplicates in this group
         """
         duplicates = {}
-        
+
         if 'ja_kodas' not in df.columns or 'line_name' not in df.columns or 'reiksme' not in df.columns:
             return duplicates
-            
+
         # Group by ja_kodas and line_name
         grouped = df.groupby(['ja_kodas', 'line_name'])
-        
+
         for (ja_kodas, line_name), group in grouped:
             if len(group) > 1:
                 # Found rows with same ja_kodas and line_name but potentially different reiksme
@@ -953,18 +1417,18 @@ def pivot_dfs_smart(
                         'indices': group.index.tolist(),
                         'values': unique_reiksme.tolist()
                     }
-                    
+
         return duplicates
 
     def pivot_dataframe_smart(
-        df: pd.DataFrame,
-        pivot_col: str,
-        value_col: str,
-        id_cols: List[str],
-        num_agg: str,
-        str_agg: str,
-        verbose: bool,
-        date_col: str = None
+            df: pd.DataFrame,
+            pivot_col: str,
+            value_col: str,
+            id_cols: List[str],
+            num_agg: str,
+            str_agg: str,
+            verbose: bool,
+            date_col: str = None
     ) -> pd.DataFrame:
         """
         Pivot with configurable aggregation and exact duplicate handling.
@@ -974,7 +1438,7 @@ def pivot_dfs_smart(
         Rows are considered duplicates if they have:
         - Exactly matching ja_kodas AND line_name values
         - Different reiksme values
-        
+
         When duplicates are found:
         - First occurrence is kept
         - Subsequent duplicates are removed
@@ -986,24 +1450,24 @@ def pivot_dfs_smart(
             keep_method = 'first'  # Will keep most recent due to sort
         else:
             keep_method = 'first'  # Default behavior
-            
+
         # Detect and report exact duplicates (ja_kodas + line_name match, reiksme differs)
         duplicates = detect_duplicates(df)
         if duplicates and verbose:
-            total_duplicates = sum(len(dup['indices'])-1 for dup in duplicates.values())
+            total_duplicates = sum(len(dup['indices']) - 1 for dup in duplicates.values())
             print(f"\nExact Duplicate Detection Report:")
             print(f"Found {len(duplicates)} duplicate groups ({total_duplicates} total duplicate rows)")
             print("Duplicate definition: exact match on ja_kodas + line_name with differing reiksme")
             if date_col and date_col in df.columns:
                 print(f"Using date column '{date_col}' - keeping most recent row in each duplicate group")
-            
+
             for key, dup_info in duplicates.items():
                 ja_kodas, line_name = key.split('|')
                 print(f"\nDuplicate Group: ja_kodas={ja_kodas}, line_name={line_name}")
                 print(f" - Keeping {'most recent' if date_col else 'first'} row (index {dup_info['indices'][0]})")
-                print(f" - Removing {len(dup_info['indices'])-1} duplicates (indices: {dup_info['indices'][1:]})")
+                print(f" - Removing {len(dup_info['indices']) - 1} duplicates (indices: {dup_info['indices'][1:]})")
                 print(f" - Differing reiksme values: {dup_info['values']}")
-        
+
         # Remove duplicates (keep first/most recent occurrence of each ja_kodas+line_name pair)
         df = df.drop_duplicates(subset=['ja_kodas', 'line_name'], keep=keep_method)
 
@@ -1037,64 +1501,138 @@ def pivot_dfs_smart(
         pivoted_df.columns.name = None
         return pivoted_df
 
-    # Convert single DataFrame to list for uniform processing
-    single_df = False
-    if isinstance(dataframes, pd.DataFrame):
-        dataframes = [dataframes]
-        single_df = True
+    # Handle inplace operation
+    if inplace:
+        if verbose:
+            print("⚠️  INPLACE MODE: Modifying original DataFrame(s)")
 
-    pivoted_dfs = []
-    total_duplicates_removed = 0
+        # Convert single DataFrame to list for uniform processing
+        single_df = False
+        if isinstance(dataframes, pd.DataFrame):
+            dataframes = [dataframes]
+            single_df = True
 
-    for i, df in enumerate(dataframes):
-        try:
-            # Check required columns
-            required_cols = [pivot_column, value_column] + id_columns
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
+        total_duplicates_removed = 0
+
+        for i, df in enumerate(dataframes):
+            try:
+                # Check required columns
+                required_cols = [pivot_column, value_column] + id_columns
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    if verbose:
+                        print(f"DataFrame {i}: Missing columns {missing_cols}")
+                    continue
+
                 if verbose:
-                    print(f"DataFrame {i}: Missing columns {missing_cols}")
+                    print(f"DataFrame {i}: Preserving {len(df.columns) - 2} columns in result")
+
+                # Perform pivot with new configurable parameters
+                pivoted_df = pivot_dataframe_smart(
+                    df=df,
+                    pivot_col=pivot_column,
+                    value_col=value_column,
+                    id_cols=id_columns,
+                    num_agg=numeric_agg,
+                    str_agg=string_agg,
+                    verbose=verbose,
+                    date_col=date_column
+                )
+
+                # Count duplicates removed in this dataframe
+                duplicates_in_df = sum(len(dup['indices']) - 1 for dup in detect_duplicates(df).values())
+                total_duplicates_removed += duplicates_in_df
+
+                # INPLACE MODIFICATION: Replace the original DataFrame content
+                df.drop(df.index, inplace=True)  # Clear all rows
+                df.drop(df.columns, axis=1, inplace=True)  # Clear all columns
+
+                # Copy pivoted data back to original DataFrame
+                for col in pivoted_df.columns:
+                    df[col] = pivoted_df[col]
+
+                if verbose:
+                    print(f"DataFrame {i}: Successfully pivoted INPLACE. New shape: {df.shape}")
+                    if duplicates_in_df > 0:
+                        print(f"Removed {duplicates_in_df} duplicate rows")
+
+            except Exception as e:
+                if verbose:
+                    print(f"DataFrame {i}: Error during pivoting - {e}")
+
+        # Final summary for inplace mode
+        if verbose and total_duplicates_removed > 0:
+            print(f"\n🎯 FINAL DUPLICATE REMOVAL SUMMARY (INPLACE):")
+            print(f"   📊 Total duplicate rows removed across all DataFrames: {total_duplicates_removed}")
+            if date_column:
+                print(f"   📅 Using date column '{date_column}' - kept most recent rows in duplicate groups")
+
+        return None  # Inplace operations return None
+
+    else:
+        # ORIGINAL BEHAVIOR (create new objects)
+        if verbose:
+            print("🆕 NEW OBJECT MODE: Creating new DataFrame(s)")
+
+        # Convert single DataFrame to list for uniform processing
+        single_df = False
+        if isinstance(dataframes, pd.DataFrame):
+            dataframes = [dataframes]
+            single_df = True
+
+        pivoted_dfs = []
+        total_duplicates_removed = 0
+
+        for i, df in enumerate(dataframes):
+            try:
+                # Check required columns
+                required_cols = [pivot_column, value_column] + id_columns
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    if verbose:
+                        print(f"DataFrame {i}: Missing columns {missing_cols}")
+                    pivoted_dfs.append(df)
+                    continue
+
+                if verbose:
+                    print(f"DataFrame {i}: Preserving {len(df.columns) - 2} columns in result")
+
+                # Perform pivot with new configurable parameters
+                pivoted_df = pivot_dataframe_smart(
+                    df=df,
+                    pivot_col=pivot_column,
+                    value_col=value_column,
+                    id_cols=id_columns,
+                    num_agg=numeric_agg,
+                    str_agg=string_agg,
+                    verbose=verbose,
+                    date_col=date_column
+                )
+
+                # Count duplicates removed in this dataframe
+                duplicates_in_df = sum(len(dup['indices']) - 1 for dup in detect_duplicates(df).values())
+                total_duplicates_removed += duplicates_in_df
+
+                pivoted_dfs.append(pivoted_df)
+                if verbose:
+                    print(
+                        f"DataFrame {i}: Successfully pivoted. Original shape: {df.shape}, Pivoted shape: {pivoted_df.shape}")
+                    if duplicates_in_df > 0:
+                        print(f"Removed {duplicates_in_df} duplicate rows")
+
+            except Exception as e:
+                if verbose:
+                    print(f"DataFrame {i}: Error during pivoting - {e}")
                 pivoted_dfs.append(df)
-                continue
 
-            if verbose:
-                print(f"DataFrame {i}: Preserving {len(df.columns) - 2} columns in result")
+        # Final summary for new object mode
+        if verbose and total_duplicates_removed > 0:
+            print(f"\n🎯 FINAL DUPLICATE REMOVAL SUMMARY:")
+            print(f"   📊 Total duplicate rows removed across all DataFrames: {total_duplicates_removed}")
+            if date_column:
+                print(f"   📅 Using date column '{date_column}' - kept most recent rows in duplicate groups")
 
-            # Perform pivot with new configurable parameters
-            pivoted_df = pivot_dataframe_smart(
-                df=df,
-                pivot_col=pivot_column,
-                value_col=value_column,
-                id_cols=id_columns,
-                num_agg=numeric_agg,
-                str_agg=string_agg,
-                verbose=verbose,
-                date_col=date_column
-            )
-
-            # Count duplicates removed in this dataframe
-            duplicates_in_df = sum(len(dup['indices'])-1 for dup in detect_duplicates(df).values())
-            total_duplicates_removed += duplicates_in_df
-            
-            pivoted_dfs.append(pivoted_df)
-            if verbose:
-                print(f"DataFrame {i}: Successfully pivoted. Original shape: {df.shape}, Pivoted shape: {pivoted_df.shape}")
-                if duplicates_in_df > 0:
-                    print(f"Removed {duplicates_in_df} duplicate rows")
-
-        except Exception as e:
-            if verbose:
-                print(f"DataFrame {i}: Error during pivoting - {e}")
-            pivoted_dfs.append(df)
-
-    # Final summary
-    if verbose and total_duplicates_removed > 0:
-        print(f"\n🎯 FINAL DUPLICATE REMOVAL SUMMARY:")
-        print(f"   📊 Total duplicate rows removed across all DataFrames: {total_duplicates_removed}")
-        if date_column:
-            print(f"   📅 Using date column '{date_column}' - kept most recent rows in duplicate groups")
-    
-    return pivoted_dfs[0] if single_df else pivoted_dfs
+        return pivoted_dfs[0] if single_df else pivoted_dfs
 
 def rename_columns_if_exist(data: Union[pd.DataFrame, List[pd.DataFrame]],
                            current_columns: Union[str, List[str]],
@@ -1267,7 +1805,8 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                   merge_type: str = 'concat',
                   separator: str = ' ',
                   conflict_resolution: str = 'coalesce',
-                  custom_function: Callable = None) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                  custom_function: Callable = None,
+                  inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame]]:
     """
     Merge multiple columns in DataFrame(s) using various merge strategies.
 
@@ -1286,10 +1825,10 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
     :param merge_type: Type of merge operation. Options:
                       - 'concat': Concatenate string values with separator
                       - 'coalesce': Take first non-null value
-                      - 'sum': Sum numeric values
-                      - 'mean': Average numeric values
-                      - 'min': Minimum value
-                      - 'max': Maximum value
+                      - 'sum': Sum numeric values (NA treated as 0)
+                      - 'mean': Average numeric values (NA treated as 0)
+                      - 'min': Minimum value (NA treated as 0)
+                      - 'max': Maximum value (NA treated as 0)
                       - 'custom': Use custom_function
     :type merge_type: str
 
@@ -1305,27 +1844,64 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
     :param custom_function: Custom function for merging (used with merge_type='custom')
     :type custom_function: Callable, optional
 
-    :return: DataFrame(s) with merged columns
-    :rtype: Union[pd.DataFrame, List[pd.DataFrame]]
+    :param inplace: If True, modify the original DataFrame(s). If False, return new DataFrame(s)
+    :type inplace: bool
+
+    :return: DataFrame(s) with merged columns (None if inplace=True)
+    :rtype: Union[pd.DataFrame, List[pd.DataFrame], None]
     """
+    # Validate merge_type
+    valid_merge_types = ['concat', 'coalesce', 'sum', 'mean', 'min', 'max', 'custom']
+    if merge_type not in valid_merge_types:
+        raise ValueError(f"Invalid merge_type: {merge_type}. Must be one of {valid_merge_types}")
+
+    # Validate conflict_resolution
+    valid_conflict_resolutions = ['coalesce', 'keep_both', 'error']
+    if conflict_resolution not in valid_conflict_resolutions:
+        raise ValueError(
+            f"Invalid conflict_resolution: {conflict_resolution}. Must be one of {valid_conflict_resolutions}")
+
+    # Check for custom function requirement
+    if merge_type == 'custom' and custom_function is None:
+        raise ValueError("custom_function must be provided when merge_type='custom'")
+
+    # Check if custom_function is callable when provided
+    if custom_function is not None and not callable(custom_function):
+        raise ValueError("custom_function must be callable")
+
     # Convert single DataFrame to list for uniform processing
     single_df = False
+    original_dataframes = dataframes
+
     if isinstance(dataframes, pd.DataFrame):
         dataframes = [dataframes]
         single_df = True
 
+    # Check if dataframes list is empty
+    if not dataframes:
+        raise ValueError("No DataFrames provided")
+
+    # Check if all items in dataframes list are DataFrames
+    for i, df in enumerate(dataframes):
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError(f"Item at index {i} in dataframes is not a pandas DataFrame")
+
     # Process columns parameter
     if isinstance(columns, str):
         # Single string - treat as prefix or exact column name
-        column_list = [col for col in dataframes[0].columns if col.startswith(columns)] if len(dataframes) > 0 else []
-        if not column_list:
+        if len(dataframes) > 0:
+            column_list = [col for col in dataframes[0].columns if col.startswith(columns)]
+            if not column_list:
+                column_list = [columns]
+        else:
             column_list = [columns]
-    elif isinstance(columns, (tuple, list)) and len(columns) == 2:
-        # Two columns specified
+    elif isinstance(columns, (tuple, list)):
+        # Two or more columns specified
+        if len(columns) < 2:
+            raise ValueError(f"At least 2 columns required for merging. Got: {columns}")
         column_list = list(columns)
     else:
-        # List of columns
-        column_list = list(columns)
+        raise ValueError(f"columns must be str, list, or tuple. Got: {type(columns)}")
 
     if len(column_list) < 2:
         raise ValueError(f"At least 2 columns required for merging. Got: {column_list}")
@@ -1334,11 +1910,20 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
     if new_column_name is None:
         new_column_name = f"merged_{column_list[0]}"
 
+    # Check if new_column_name conflicts with existing columns
+    for i, df in enumerate(dataframes):
+        if new_column_name in df.columns and not inplace:
+            print(f"Warning: DataFrame {i}: Column '{new_column_name}' already exists and will be overwritten")
+
     processed_dfs = []
 
     for i, df in enumerate(dataframes):
         try:
-            df_working = df.copy()
+            # Use original DataFrame if inplace, otherwise work on copy
+            if inplace:
+                df_working = df
+            else:
+                df_working = df.copy()
 
             # Check if all columns exist
             missing_columns = [col for col in column_list if col not in df_working.columns]
@@ -1348,32 +1933,34 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                 available_columns = [col for col in column_list if col in df_working.columns]
                 if len(available_columns) < 2:
                     print(f"DataFrame {i}: Not enough columns to merge, skipping")
-                    processed_dfs.append(df_working)
+                    processed_dfs.append(df_working if not inplace else df)
                     continue
-                column_list = available_columns
+                column_list_for_df = available_columns
+            else:
+                column_list_for_df = column_list
 
-            print(f"DataFrame {i}: Merging columns {column_list} using '{merge_type}' strategy")
+            print(f"DataFrame {i}: Merging columns {column_list_for_df} using '{merge_type}' strategy")
 
             # Perform merge based on type
             if merge_type == 'concat':
-                # String concatenation
-                merged_values = df_working[column_list[0]].astype(str)
-                for col in column_list[1:]:
-                    merged_values = merged_values + separator + df_working[col].astype(str)
+                # String concatenation - replace NaN with empty string for concatenation
+                merged_values = df_working[column_list_for_df[0]].fillna('').astype(str)
+                for col in column_list_for_df[1:]:
+                    merged_values = merged_values + separator + df_working[col].fillna('').astype(str)
                 df_working[new_column_name] = merged_values
 
             elif merge_type == 'coalesce':
                 # Take first non-null value
                 if conflict_resolution == 'coalesce':
-                    df_working[new_column_name] = df_working[column_list[0]]
-                    for col in column_list[1:]:
+                    df_working[new_column_name] = df_working[column_list_for_df[0]]
+                    for col in column_list_for_df[1:]:
                         mask = df_working[new_column_name].isna()
                         df_working.loc[mask, new_column_name] = df_working.loc[mask, col]
 
                 elif conflict_resolution == 'keep_both':
                     # Keep both values as a list
                     def combine_values(row):
-                        values = [row[col] for col in column_list if pd.notna(row[col])]
+                        values = [row[col] for col in column_list_for_df if pd.notna(row[col])]
                         return values if values else np.nan
 
                     df_working[new_column_name] = df_working.apply(combine_values, axis=1)
@@ -1381,46 +1968,56 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                 elif conflict_resolution == 'error':
                     # Check for conflicts
                     for idx, row in df_working.iterrows():
-                        non_null_values = [row[col] for col in column_list if pd.notna(row[col])]
+                        non_null_values = [row[col] for col in column_list_for_df if pd.notna(row[col])]
                         if len(non_null_values) > 1 and len(set(non_null_values)) > 1:
                             raise ValueError(f"Conflict in row {idx}: {non_null_values}")
-                    df_working[new_column_name] = df_working[column_list[0]].combine_first(df_working[column_list[1]])
+                    df_working[new_column_name] = df_working[column_list_for_df[0]].combine_first(
+                        df_working[column_list_for_df[1]])
 
             elif merge_type in ['sum', 'mean', 'min', 'max']:
-                # Numeric operations
-                numeric_cols = [col for col in column_list if pd.api.types.is_numeric_dtype(df_working[col])]
-                if len(numeric_cols) < len(column_list):
-                    print(f"DataFrame {i}: Some columns are not numeric: {set(column_list) - set(numeric_cols)}")
+                # Numeric operations - treat NA as 0
+                numeric_cols = [col for col in column_list_for_df if pd.api.types.is_numeric_dtype(df_working[col])]
+                if len(numeric_cols) < len(column_list_for_df):
+                    non_numeric_cols = set(column_list_for_df) - set(numeric_cols)
+                    print(f"DataFrame {i}: Some columns are not numeric and will be skipped: {non_numeric_cols}")
+
+                if len(numeric_cols) < 1:
+                    raise ValueError(f"DataFrame {i}: No numeric columns available for {merge_type} operation")
+
+                # Fill NA with 0 for numeric operations
+                numeric_data = df_working[numeric_cols].fillna(0)
 
                 if merge_type == 'sum':
-                    df_working[new_column_name] = df_working[numeric_cols].sum(axis=1, skipna=True)
+                    df_working[new_column_name] = numeric_data.sum(axis=1)
                 elif merge_type == 'mean':
-                    df_working[new_column_name] = df_working[numeric_cols].mean(axis=1, skipna=True)
+                    # Calculate mean treating NA as 0
+                    df_working[new_column_name] = numeric_data.mean(axis=1)
                 elif merge_type == 'min':
-                    df_working[new_column_name] = df_working[numeric_cols].min(axis=1, skipna=True)
+                    df_working[new_column_name] = numeric_data.min(axis=1)
                 elif merge_type == 'max':
-                    df_working[new_column_name] = df_working[numeric_cols].max(axis=1, skipna=True)
+                    df_working[new_column_name] = numeric_data.max(axis=1)
 
             elif merge_type == 'custom' and custom_function:
                 # Custom merge function
-                df_working[new_column_name] = df_working[column_list].apply(custom_function, axis=1)
+                df_working[new_column_name] = df_working[column_list_for_df].apply(custom_function, axis=1)
 
-            else:
-                raise ValueError(f"Unsupported merge_type: {merge_type}")
+            if not inplace:
+                processed_dfs.append(df_working)
 
-            # Remove original columns if desired (optional - you can add this parameter)
-            # if remove_original:
-            #     df_working = df_working.drop(columns=column_list)
-
-            processed_dfs.append(df_working)
             print(f"DataFrame {i}: Successfully created '{new_column_name}'")
 
         except Exception as e:
             print(f"DataFrame {i}: Error merging columns - {e}")
-            processed_dfs.append(df)
+            if not inplace:
+                processed_dfs.append(df.copy() if hasattr(df, 'copy') else df)
 
-    # Return single DataFrame if input was single
-    return processed_dfs[0] if single_df else processed_dfs
+    # Handle return based on inplace parameter
+    if inplace:
+        # Return None for inplace operations to match pandas convention
+        return None
+    else:
+        # Return single DataFrame if input was single
+        return processed_dfs[0] if single_df else processed_dfs
 
 
 # Specialized functions for common merge operations
@@ -1428,95 +2025,394 @@ def merge_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
 def concatenate_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                         columns: Union[List[str], Tuple[str, str]],
                         new_column_name: str = None,
-                        separator: str = ' ') -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                        separator: str = ' ',
+                        inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
-    Concatenate multiple columns into a single string column.
+    Concatenate multiple columns into a single string column and remove only the merged columns.
 
     Parameters:
     -----------
     :param dataframes: Input DataFrame or list of DataFrames to process
     :type dataframes: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param columns: Column name(s) to concatenate
     :type columns: Union[List[str], Tuple[str, str]]
-    
+
     :param new_column_name: Name for the concatenated column (default: None)
     :type new_column_name: str
-    
+
     :param separator: String separator to use between values (default: ' ')
     :type separator: str
 
+    :param inplace: If True, modifies the original DataFrame(s) in place (default: True)
+    :type inplace: bool
+
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - New column containing concatenated values from input columns
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=True: None (original DataFrame(s) are modified in place)
+        - If inplace=False: New DataFrame(s) with concatenated columns
     """
-    return merge_columns(dataframes, columns, new_column_name, 'concat', separator)
+
+    def concatenate_single_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Convert columns to list if needed
+        if isinstance(columns, tuple):
+            col_list = list(columns)
+        else:
+            col_list = columns.copy()
+
+        # Set default new column name if not provided
+        if new_column_name is None:
+            new_column_name_final = f"concat_{'_'.join(col_list)}"
+        else:
+            new_column_name_final = new_column_name
+
+        # Check which columns actually exist in this DataFrame
+        existing_columns = [col for col in col_list if col in df.columns]
+
+        if not existing_columns:
+            print(f"Warning: None of the columns {col_list} found in DataFrame")
+            return df
+
+        # Create a copy to avoid modifying the original during processing
+        df_result = df.copy()
+
+        if len(existing_columns) == 1:
+            # If only one column exists, just rename it if needed
+            if existing_columns[0] != new_column_name_final:
+                df_result = df_result.rename(columns={existing_columns[0]: new_column_name_final})
+        else:
+            # Concatenate the columns
+            merged_values = df_result[existing_columns[0]].fillna('').astype(str)
+            for col in existing_columns[1:]:
+                merged_values = merged_values + separator + df_result[col].fillna('').astype(str)
+
+            df_result[new_column_name_final] = merged_values
+
+            # Remove only the columns that were merged (keep all other columns)
+            # Don't remove the column if it's the same as the new column name
+            columns_to_remove = [col for col in existing_columns if col != new_column_name_final]
+            df_result = df_result.drop(columns=columns_to_remove)
+
+        return df_result
+
+    # Handle inplace operation using shared logic
+    return _process_dataframes(dataframes, concatenate_single_df, "concatenated", columns, new_column_name, inplace)
 
 
 def coalesce_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                      columns: Union[List[str], Tuple[str, str]],
                      new_column_name: str = None,
-                     conflict_resolution: str = 'coalesce') -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                     method: str = 'coalesce',
+                     inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
-    Coalesce multiple columns - take first non-null value.
+    Coalesce multiple columns with support for min/max operations and remove only the merged columns.
 
     Parameters:
     -----------
     :param dataframes: Input DataFrame or list of DataFrames to process
     :type dataframes: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param columns: Column name(s) to coalesce
     :type columns: Union[List[str], Tuple[str, str]]
-    
-    :param new_column_name: Name for the coalesced column (default: None)
+
+    :param new_column_name: Name for the coalesced column (default: None - uses first column name)
     :type new_column_name: str
-    
-    :param conflict_resolution: How to handle conflicts (default: 'coalesce')
-    :type conflict_resolution: str
+
+    :param method: Coalescing method (default: 'coalesce')
+                   Options:
+                   - 'coalesce': Take first non-null value (standard coalesce)
+                   - 'min': Take the minimum numeric value
+                   - 'max': Take the maximum numeric value
+                   - 'first': Take first non-null value (same as coalesce)
+                   - 'last': Take last non-null value
+    :type method: str
+
+    :param inplace: If True, modifies the original DataFrame(s) in place (default: True)
+    :type inplace: bool
 
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - New column containing first non-null values from input columns
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=True: None (original DataFrame(s) are modified in place)
+        - If inplace=False: New DataFrame(s) with coalesced columns
     """
-    return merge_columns(dataframes, columns, new_column_name, 'coalesce', conflict_resolution=conflict_resolution)
+
+    def coalesce_single_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Convert columns to list if needed
+        if isinstance(columns, tuple):
+            col_list = list(columns)
+        else:
+            col_list = columns.copy()
+
+        # Set default new column name if not provided
+        if new_column_name is None:
+            new_column_name_final = col_list[0]
+        else:
+            new_column_name_final = new_column_name
+
+        # Check which columns actually exist in this DataFrame
+        existing_columns = [col for col in col_list if col in df.columns]
+
+        if not existing_columns:
+            print(f"Warning: None of the columns {col_list} found in DataFrame")
+            return df
+
+        # Create a copy to avoid modifying the original during processing
+        df_result = df.copy()
+
+        if len(existing_columns) == 1:
+            # If only one column exists, just rename it if needed
+            if existing_columns[0] != new_column_name_final:
+                df_result = df_result.rename(columns={existing_columns[0]: new_column_name_final})
+        else:
+            # Handle different methods
+            if method in ['coalesce', 'first']:
+                # Take first non-null value
+                df_result[new_column_name_final] = df_result[existing_columns[0]]
+                for col in existing_columns[1:]:
+                    mask = df_result[new_column_name_final].isna()
+                    df_result.loc[mask, new_column_name_final] = df_result.loc[mask, col]
+
+            elif method == 'last':
+                # Take last non-null value (reverse order)
+                df_result[new_column_name_final] = df_result[existing_columns[-1]]
+                for col in reversed(existing_columns[:-1]):
+                    mask = df_result[new_column_name_final].isna()
+                    df_result.loc[mask, new_column_name_final] = df_result.loc[mask, col]
+
+            elif method in ['min', 'max']:
+                # Handle min/max - take lowest or highest numeric value
+                df_result[new_column_name_final] = None
+
+                for idx in df_result.index:
+                    # Get all non-null values for this row from the specified columns
+                    row_values = []
+                    for col in existing_columns:
+                        val = df_result.at[idx, col]
+                        if pd.notna(val):
+                            row_values.append(val)
+
+                    if not row_values:
+                        # All values are NaN, keep as NaN
+                        continue
+
+                    if method == 'min':
+                        # Take the smallest numeric value
+                        try:
+                            # Convert to numeric and find min
+                            numeric_vals = [pd.to_numeric(val, errors='coerce') for val in row_values]
+                            valid_numeric = [val for val in numeric_vals if pd.notna(val)]
+                            if valid_numeric:
+                                min_val = min(valid_numeric)
+                                # Find the original value that corresponds to this numeric value
+                                for i, (orig_val, num_val) in enumerate(zip(row_values, numeric_vals)):
+                                    if pd.notna(num_val) and num_val == min_val:
+                                        df_result.at[idx, new_column_name_final] = orig_val
+                                        break
+                            else:
+                                # No valid numeric values, take first non-null
+                                df_result.at[idx, new_column_name_final] = row_values[0]
+                        except (ValueError, TypeError):
+                            # If conversion fails, take first non-null value
+                            df_result.at[idx, new_column_name_final] = row_values[0]
+
+                    elif method == 'max':
+                        # Take the largest numeric value
+                        try:
+                            # Convert to numeric and find max
+                            numeric_vals = [pd.to_numeric(val, errors='coerce') for val in row_values]
+                            valid_numeric = [val for val in numeric_vals if pd.notna(val)]
+                            if valid_numeric:
+                                max_val = max(valid_numeric)
+                                # Find the original value that corresponds to this max numeric value
+                                for i, (orig_val, num_val) in enumerate(zip(row_values, numeric_vals)):
+                                    if pd.notna(num_val) and num_val == max_val:
+                                        df_result.at[idx, new_column_name_final] = orig_val
+                                        break
+                            else:
+                                # No valid numeric values, take first non-null
+                                df_result.at[idx, new_column_name_final] = row_values[0]
+                        except (ValueError, TypeError):
+                            # If conversion fails, take first non-null value
+                            df_result.at[idx, new_column_name_final] = row_values[0]
+
+            else:
+                raise ValueError(f"Unknown method: {method}. Use 'coalesce', 'first', 'last', 'min', or 'max'")
+
+            # Remove only the columns that were merged (keep all other columns)
+            # Don't remove the column if it's the same as the new column name
+            columns_to_remove = [col for col in existing_columns if col != new_column_name_final]
+            df_result = df_result.drop(columns=columns_to_remove)
+
+        return df_result
+
+    # Handle inplace operation using shared logic
+    return _process_dataframes(dataframes, coalesce_single_df, "coalesced", columns, new_column_name, inplace, method)
 
 
 def sum_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                 columns: Union[List[str], Tuple[str, str]],
-                new_column_name: str = None) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                new_column_name: str = None,
+                inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
-    Sum values from numeric columns.
+    Sum values from numeric columns and remove only the summed columns.
 
     Parameters:
     -----------
     :param dataframes: Input DataFrame or list of DataFrames to process
     :type dataframes: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param columns: Numeric column name(s) to sum
     :type columns: Union[List[str], Tuple[str, str]]
-    
-    :param new_column_name: Name for the summed column (default: None)
+
+    :param new_column_name: Name for the summed column (default: None - uses 'sum_of_columns')
     :type new_column_name: str
+
+    :param inplace: If True, modifies the original DataFrame(s) in place (default: True)
+    :type inplace: bool
 
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - New column containing sum of values from input columns
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=True: None (original DataFrame(s) are modified in place)
+        - If inplace=False: New DataFrame(s) with summed columns
     """
-    return merge_columns(dataframes, columns, new_column_name, 'sum')
+
+    def sum_single_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Convert columns to list if needed
+        if isinstance(columns, tuple):
+            col_list = list(columns)
+        else:
+            col_list = columns.copy()
+
+        # Set default new column name if not provided
+        if new_column_name is None:
+            new_column_name_final = f"sum_of_{'_'.join(col_list)}"
+        else:
+            new_column_name_final = new_column_name
+
+        # Check which columns actually exist in this DataFrame
+        existing_columns = [col for col in col_list if col in df.columns]
+
+        if not existing_columns:
+            print(f"Warning: None of the columns {col_list} found in DataFrame")
+            return df
+
+        # Create a copy to avoid modifying the original during processing
+        df_result = df.copy()
+
+        if len(existing_columns) == 1:
+            # If only one column exists, just rename it if needed
+            if existing_columns[0] != new_column_name_final:
+                df_result = df_result.rename(columns={existing_columns[0]: new_column_name_final})
+        else:
+            # Sum the numeric columns
+            df_result[new_column_name_final] = 0
+
+            for col in existing_columns:
+                # Convert to numeric, coercing errors to NaN
+                numeric_values = pd.to_numeric(df_result[col], errors='coerce')
+                df_result[new_column_name_final] += numeric_values.fillna(0)
+
+            # Remove only the columns that were summed (keep all other columns)
+            # Don't remove the column if it's the same as the new column name
+            columns_to_remove = [col for col in existing_columns if col != new_column_name_final]
+            df_result = df_result.drop(columns=columns_to_remove)
+
+        return df_result
+
+    # Handle inplace operation using shared logic
+    return _process_dataframes(dataframes, sum_single_df, "summed", columns, new_column_name, inplace)
 
 
+def _process_dataframes(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
+                        processing_function: Callable,
+                        operation_name: str,
+                        columns: Union[List[str], Tuple[str, str]],
+                        new_column_name: str = None,
+                        inplace: bool = True,
+                        method: str = None) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
+    """
+    Shared logic for processing DataFrames with consistent inplace behavior.
+
+    Parameters:
+    -----------
+    :param dataframes: Input DataFrame or list of DataFrames
+    :param processing_function: Function to process a single DataFrame
+    :param operation_name: Name of the operation for logging
+    :param columns: Columns being processed
+    :param new_column_name: New column name
+    :param inplace: Whether to modify in place
+    :param method: Optional method parameter for logging
+
+    Returns:
+    --------
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+    """
+    if inplace:
+        # Convert single DataFrame to list for uniform processing
+        if isinstance(dataframes, pd.DataFrame):
+            dataframes_list = [dataframes]
+            single_df = True
+        else:
+            dataframes_list = dataframes
+            single_df = False
+
+        # Modify DataFrames in place
+        for i, df in enumerate(dataframes_list):
+            try:
+                original_columns = list(df.columns)
+                result_df = processing_function(df)
+
+                # Clear the original DataFrame but preserve its identity
+                original_index = df.index
+
+                # Clear all data but maintain structure
+                df.drop(columns=df.columns, inplace=True)
+
+                # Copy all columns from result back to original DataFrame
+                for col in result_df.columns:
+                    df[col] = result_df[col]
+
+                # Restore original index if it was changed
+                if not df.index.equals(original_index):
+                    df.index = original_index
+
+                # Get the list of columns that were actually removed
+                removed_columns = [col for col in original_columns if col not in df.columns]
+                if removed_columns:
+                    method_info = f" using {method} method" if method else ""
+                    new_col_name = new_column_name or (
+                        columns[0] if operation_name == "coalesced" else f"{operation_name}_{'_'.join(columns)}")
+                    print(
+                        f"{operation_name.capitalize()} columns {removed_columns} -> '{new_col_name}'{method_info} in DataFrame {i}")
+                else:
+                    new_col_name = new_column_name or (
+                        columns[0] if operation_name == "coalesced" else f"{operation_name}_{'_'.join(columns)}")
+                    print(f"Renamed column to '{new_col_name}' in DataFrame {i}")
+
+            except Exception as e:
+                print(f"Error processing DataFrame {i}: {e}")
+                raise
+
+        return None  # Inplace operations return None
+
+    else:
+        # Return new DataFrame(s)
+        if isinstance(dataframes, pd.DataFrame):
+            return processing_function(dataframes)
+        elif isinstance(dataframes, list):
+            return [processing_function(df) for df in dataframes]
+        else:
+            raise ValueError("dataframes must be a DataFrame or list of DataFrames")
 def filter_rows_by_value(
-    data: Union[pd.DataFrame, List[pd.DataFrame]],
-    column: Union[str, List[str]],
-    value: Union[Any, List[Any], Tuple[Any, Any]],
-    verbose: bool = True
-) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+        data: Union[pd.DataFrame, List[pd.DataFrame]],
+        column: Union[str, List[str], Dict[str, Union[Any, List[Any], Tuple[Any, Any]]]],
+        value: Union[Any, List[Any], Tuple[Any, Any], Dict[str, Union[Any, List[Any], Tuple[Any, Any]]]] = None,
+        verbose: bool = True,
+        inplace: bool = False
+) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
     Filter rows by matching specified value(s) or range in column(s).
 
@@ -1524,99 +2420,791 @@ def filter_rows_by_value(
     -----------
     :param data: Input DataFrame or list of DataFrames to filter
     :type data: Union[pd.DataFrame, List[pd.DataFrame]]
-    
-    :param column: Column name or list of column names to filter on
-    :type column: Union[str, List[str]]
-    
+
+    :param column: Column name or list of column names to filter on, or a dictionary for advanced filtering
+                  If using dictionary format, the value parameter should be None
+    :type column: Union[str, List[str], Dict[str, Union[Any, List[Any], Tuple[Any, Any]]]]
+
     :param value: Value(s) to match in the column(s). Can be:
-                 - Single value
-                 - List of values (matches any in list)
-                 - Tuple of two values (matches values between them, inclusive)
-    :type value: Union[Any, List[Any], Tuple[Any, Any]]
-    
+                 - Single value (applied to all columns)
+                 - List of values (matches any in list, applied to all columns)
+                 - Tuple of two values (matches values between them, inclusive, applied to all columns)
+                 - Dictionary mapping column names to their respective filter values/ranges
+                 - None (when using dictionary format for column parameter)
+    :type value: Union[Any, List[Any], Tuple[Any, Any], Dict[str, Union[Any, List[Any], Tuple[Any, Any]]], None]
+
     :param verbose: Whether to print progress messages (default: True)
     :type verbose: bool
 
+    :param inplace: If True, modifies the original DataFrame(s) in place and returns None (default: False)
+    :type inplace: bool
+
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Filtered DataFrame(s) containing only rows where:
-        - Column values match the specified value(s) or range
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=False: New filtered DataFrame(s)
+        - If inplace=True: None (original DataFrame(s) are modified in place)
     """
+
+    def parse_filter_conditions(column_input, value_input):
+        """
+        Parse filter conditions into a standardized dictionary format.
+
+        Returns:
+        --------
+        Dict[str, Dict[str, Any]]: Dictionary with column names as keys and filter info as values
+        """
+        conditions = {}
+
+        # Case 1: Dictionary format for advanced filtering
+        if isinstance(column_input, dict):
+            for col, val in column_input.items():
+                if isinstance(val, (tuple, list)) and len(val) == 2:
+                    # Range filter
+                    range_min, range_max = sorted(val)
+                    conditions[col] = {
+                        'type': 'range',
+                        'min': range_min,
+                        'max': range_max,
+                        'values': None
+                    }
+                elif isinstance(val, (list, tuple)):
+                    # Multiple values filter
+                    conditions[col] = {
+                        'type': 'values',
+                        'min': None,
+                        'max': None,
+                        'values': list(val)
+                    }
+                else:
+                    # Single value filter
+                    conditions[col] = {
+                        'type': 'values',
+                        'min': None,
+                        'max': None,
+                        'values': [val]
+                    }
+            return conditions
+
+        # Case 2: Column(s) with separate value parameter
+        columns = [column_input] if isinstance(column_input, str) else list(column_input)
+
+        if isinstance(value_input, dict):
+            # Value is a dictionary mapping columns to their filters
+            for col in columns:
+                if col in value_input:
+                    val = value_input[col]
+                    if isinstance(val, (tuple, list)) and len(val) == 2:
+                        range_min, range_max = sorted(val)
+                        conditions[col] = {
+                            'type': 'range',
+                            'min': range_min,
+                            'max': range_max,
+                            'values': None
+                        }
+                    elif isinstance(val, (list, tuple)):
+                        conditions[col] = {
+                            'type': 'values',
+                            'min': None,
+                            'max': None,
+                            'values': list(val)
+                        }
+                    else:
+                        conditions[col] = {
+                            'type': 'values',
+                            'min': None,
+                            'max': None,
+                            'values': [val]
+                        }
+                else:
+                    raise ValueError(f"Column '{col}' not found in value dictionary")
+        else:
+            # Same value/range applied to all columns
+            if isinstance(value_input, (tuple, list)) and len(value_input) == 2:
+                # Range filter for all columns
+                range_min, range_max = sorted(value_input)
+                for col in columns:
+                    conditions[col] = {
+                        'type': 'range',
+                        'min': range_min,
+                        'max': range_max,
+                        'values': None
+                    }
+            elif isinstance(value_input, (list, tuple)):
+                # Multiple values for all columns
+                for col in columns:
+                    conditions[col] = {
+                        'type': 'values',
+                        'min': None,
+                        'max': None,
+                        'values': list(value_input)
+                    }
+            else:
+                # Single value for all columns
+                for col in columns:
+                    conditions[col] = {
+                        'type': 'values',
+                        'min': None,
+                        'max': None,
+                        'values': [value_input]
+                    }
+
+        return conditions
+
+    def create_filter_mask(df, conditions):
+        """Create a filter mask based on the conditions dictionary"""
+        mask = pd.Series(True, index=df.index)
+
+        for col, condition in conditions.items():
+            if col not in df.columns:
+                if verbose:
+                    print(f"Warning: Column '{col}' not found in DataFrame - skipping")
+                continue
+
+            if condition['type'] == 'range':
+                mask &= df[col].between(condition['min'], condition['max'], inclusive='both')
+            elif condition['type'] == 'values':
+                mask &= df[col].isin(condition['values'])
+
+        return mask
+
     # Convert single DataFrame to list for uniform processing
     single_df = False
     if isinstance(data, pd.DataFrame):
         data = [data]
         single_df = True
 
-    # Convert single column to list
-    if isinstance(column, str):
-        columns = [column]
-    else:
-        columns = list(column)
-
-    # Determine filter type (exact match or range)
-    is_range = isinstance(value, (tuple, list)) and len(value) == 2
-    if is_range:
-        range_min, range_max = sorted(value)
-    elif not isinstance(value, (list, tuple)):
-        values = [value]
-    else:
-        values = list(value)
-
-    filtered_dfs = []
-    total_rows_removed = 0
-
-    for i, df in enumerate(data):
-        try:
-            original_rows = len(df)
-            filtered_df = df.copy()
-
-            # Check if all specified columns exist
-            missing_cols = [col for col in columns if col not in df.columns]
-            if missing_cols:
-                if verbose:
-                    print(f"DataFrame {i}: Missing columns {missing_cols}. Available: {list(df.columns)}")
-                filtered_dfs.append(df)
-                continue
-
-            # Create filter mask based on filter type
-            mask = pd.Series(True, index=df.index)
-            for col in columns:
-                if is_range:
-                    mask &= filtered_df[col].between(range_min, range_max, inclusive='both')
+    # Parse filter conditions
+    try:
+        conditions = parse_filter_conditions(column, value)
+        if verbose:
+            print("🔍 Filter Conditions:")
+            for col, condition in conditions.items():
+                if condition['type'] == 'range':
+                    print(f"   - {col}: between {condition['min']} and {condition['max']}")
                 else:
-                    mask &= filtered_df[col].isin(values)
+                    print(f"   - {col}: in {condition['values']}")
+    except Exception as e:
+        if verbose:
+            print(f"Error parsing filter conditions: {e}")
+        return data[0] if single_df else data
 
-            # Apply filter
-            rows_before = len(filtered_df)
-            filtered_df = filtered_df[mask]
-            rows_removed = rows_before - len(filtered_df)
-            total_rows_removed += rows_removed
+    # Handle inplace operation
+    if inplace:
+        if verbose:
+            print("⚠️  INPLACE MODE: Modifying original DataFrame(s)")
 
+        total_rows_removed = 0
+
+        for i, df in enumerate(data):
+            try:
+                original_rows = len(df)
+
+                # Create filter mask
+                mask = create_filter_mask(df, conditions)
+
+                # Apply filter INPLACE by dropping rows that don't match
+                rows_before = len(df)
+                rows_to_drop = df[~mask].index
+                df.drop(rows_to_drop, inplace=True)
+                rows_removed = rows_before - len(df)
+                total_rows_removed += rows_removed
+
+                if verbose:
+                    print(f"DataFrame {i}: Modified INPLACE. Original rows: {original_rows}, "
+                          f"Current rows: {len(df)}, Removed: {rows_removed}")
+
+            except Exception as e:
+                if verbose:
+                    print(f"DataFrame {i}: Error filtering rows - {e}")
+
+        # Final summary for inplace mode
+        if verbose:
+            print(f"\n🎯 FILTERING SUMMARY (INPLACE):")
+            print(f"   📊 Total rows removed across all DataFrames: {total_rows_removed}")
+
+        return None  # Inplace operations return None
+
+    else:
+        # NEW OBJECT MODE
+        if verbose:
+            print("🆕 NEW OBJECT MODE: Creating new DataFrame(s)")
+
+        filtered_dfs = []
+        total_rows_removed = 0
+
+        for i, df in enumerate(data):
+            try:
+                original_rows = len(df)
+
+                # Create filter mask
+                mask = create_filter_mask(df, conditions)
+
+                # Apply filter to copy
+                rows_before = len(df)
+                filtered_df = df[mask].copy()
+                rows_removed = rows_before - len(filtered_df)
+                total_rows_removed += rows_removed
+
+                if verbose:
+                    print(f"DataFrame {i}: Original rows: {original_rows}, Filtered rows: {len(filtered_df)}, "
+                          f"Removed: {rows_removed}")
+
+                filtered_dfs.append(filtered_df)
+
+            except Exception as e:
+                if verbose:
+                    print(f"DataFrame {i}: Error filtering rows - {e}")
+                filtered_dfs.append(df)
+
+        # Final summary for new object mode
+        if verbose:
+            print(f"\n🎯 FILTERING SUMMARY:")
+            print(f"   📊 Total rows removed across all DataFrames: {total_rows_removed}")
+
+        return filtered_dfs[0] if single_df else filtered_dfs
+
+def remove_duplicate_rows(
+            data: Union[pd.DataFrame, List[pd.DataFrame]],
+            duplicate_columns: Union[str, List[str]],
+            keep: str = 'first',
+            date_column: str = None,
+            verbose: bool = True,
+            inplace: bool = False
+    ) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
+        """
+        Remove duplicate rows based on specified columns with flexible removal methods.
+
+        Parameters:
+        -----------
+        :param data: Input DataFrame or list of DataFrames to process
+        :type data: Union[pd.DataFrame, List[pd.DataFrame]]
+
+        :param duplicate_columns: Column name(s) to identify duplicates
+        :type duplicate_columns: Union[str, List[str]]
+
+        :param keep: Which duplicates to keep. Options:
+                    - 'first': Keep first occurrence (default)
+                    - 'last': Keep last occurrence
+                    - 'none': Remove all duplicates (keep none)
+                    - False: Remove all duplicates (keep none)
+        :type keep: str
+
+        :param date_column: Optional date column to determine which duplicate to keep (most recent)
+        :type date_column: str
+
+        :param verbose: Whether to print progress messages (default: True)
+        :type verbose: bool
+
+        :param inplace: If True, modifies the original DataFrame(s) in place and returns None (default: False)
+        :type inplace: bool
+
+        Returns:
+        --------
+        Union[pd.DataFrame, List[pd.DataFrame], None]
+            - If inplace=False: New DataFrame(s) with duplicates removed
+            - If inplace=True: None (original DataFrame(s) are modified in place)
+        """
+
+        def analyze_duplicates(df: pd.DataFrame, dup_cols: List[str]) -> Dict[str, Any]:
+            """
+            Analyze duplicates in the DataFrame.
+
+            Returns:
+            --------
+            Dict with duplicate analysis information
+            """
+            # Count duplicates
+            duplicate_mask = df.duplicated(subset=dup_cols, keep=False)
+            duplicate_groups = df[duplicate_mask].groupby(dup_cols).size()
+
+            return {
+                'total_duplicate_rows': duplicate_mask.sum(),
+                'duplicate_groups_count': len(duplicate_groups),
+                'duplicate_groups': duplicate_groups,
+                'duplicate_indices': df[duplicate_mask].index.tolist()
+            }
+
+        def remove_duplicates_single_df(df: pd.DataFrame, dup_cols: List[str], keep_method: str,
+                                        date_col: str = None) -> pd.DataFrame:
+            """
+            Remove duplicates from a single DataFrame.
+            """
+            # Sort by date column if provided (most recent first)
+            if date_col and date_col in df.columns:
+                df_sorted = df.sort_values(date_col, ascending=False)
+                # Use 'first' to keep most recent due to sort
+                final_keep = 'first'
+            else:
+                df_sorted = df
+                final_keep = keep_method
+
+            # Handle 'none' or False to remove all duplicates
+            if keep_method in ['none', False]:
+                # Keep only rows that are not duplicates at all
+                df_deduplicated = df_sorted.drop_duplicates(subset=dup_cols, keep=False)
+            else:
+                # Keep first/last occurrence
+                df_deduplicated = df_sorted.drop_duplicates(subset=dup_cols, keep=final_keep)
+
+            return df_deduplicated
+
+        # Convert single DataFrame to list for uniform processing
+        single_df = False
+        if isinstance(data, pd.DataFrame):
+            data = [data]
+            single_df = True
+
+        # Convert duplicate_columns to list
+        if isinstance(duplicate_columns, str):
+            dup_cols = [duplicate_columns]
+        else:
+            dup_cols = list(duplicate_columns)
+
+        # Validate keep parameter
+        valid_keep_options = ['first', 'last', 'none', False]
+        if keep not in valid_keep_options:
+            raise ValueError(f"keep must be one of {valid_keep_options}")
+
+        if verbose:
+            print(f"🔍 Duplicate Removal Configuration:")
+            print(f"   📊 Duplicate columns: {dup_cols}")
+            print(f"   🎯 Keep method: {keep}")
+            if date_column:
+                print(f"   📅 Date column: {date_column} (keeping most recent)")
+            print(f"   💾 Inplace mode: {inplace}")
+
+        # Handle inplace operation
+        if inplace:
             if verbose:
-                print(f"DataFrame {i}: Original rows: {original_rows}, Filtered rows: {len(filtered_df)}, "
-                      f"Removed: {rows_removed}")
-                if rows_removed > 0:
-                    if is_range:
-                        print(f"   - Kept rows where {columns} are between {range_min} and {range_max}")
-                    else:
-                        print(f"   - Kept rows where {columns} contain {values}")
+                print("⚠️  INPLACE MODE: Modifying original DataFrame(s)")
 
-            filtered_dfs.append(filtered_df)
+            total_duplicates_removed = 0
+            total_groups_found = 0
+
+            for i, df in enumerate(data):
+                try:
+                    original_rows = len(df)
+
+                    # Check if all specified columns exist
+                    missing_cols = [col for col in dup_cols if col not in df.columns]
+                    if missing_cols:
+                        if verbose:
+                            print(f"DataFrame {i}: Missing columns {missing_cols}. Available: {list(df.columns)}")
+                        continue
+
+                    # Analyze duplicates before removal
+                    if verbose:
+                        dup_analysis = analyze_duplicates(df, dup_cols)
+                        total_groups_found += dup_analysis['duplicate_groups_count']
+
+                    # Remove duplicates INPLACE
+                    if keep in ['none', False]:
+                        # For removing all duplicates, we need to identify which rows to keep
+                        non_duplicate_mask = ~df.duplicated(subset=dup_cols, keep=False)
+                        rows_to_keep = df[non_duplicate_mask].index
+                        rows_to_drop = df[~non_duplicate_mask].index
+                    else:
+                        # For keeping first/last, we can use drop_duplicates directly
+                        if date_column and date_column in df.columns:
+                            # Sort by date first
+                            df.sort_values(date_column, ascending=False, inplace=True)
+
+                        # Mark duplicates to remove (all except the ones we want to keep)
+                        if keep == 'first':
+                            rows_to_drop = df[df.duplicated(subset=dup_cols, keep='first')].index
+                        else:  # keep == 'last'
+                            rows_to_drop = df[df.duplicated(subset=dup_cols, keep='last')].index
+                        rows_to_keep = df.index.difference(rows_to_drop)
+
+                    # Remove duplicates in place
+                    rows_before = len(df)
+                    df.drop(rows_to_drop, inplace=True)
+                    rows_removed = rows_before - len(df)
+                    total_duplicates_removed += rows_removed
+
+                    if verbose:
+                        print(f"DataFrame {i}: Modified INPLACE. Original rows: {original_rows}, "
+                              f"Current rows: {len(df)}, Removed: {rows_removed}")
+
+                except Exception as e:
+                    if verbose:
+                        print(f"DataFrame {i}: Error removing duplicates - {e}")
+
+            # Final summary for inplace mode
+            if verbose:
+                print(f"\n🎯 DUPLICATE REMOVAL SUMMARY (INPLACE):")
+                print(f"   📊 Total duplicate rows removed: {total_duplicates_removed}")
+                print(f"   🔍 Total duplicate groups found: {total_groups_found}")
+                if date_column:
+                    print(f"   📅 Using date column '{date_column}' - kept most recent rows")
+
+            return None  # Inplace operations return None
+
+        else:
+            # NEW OBJECT MODE
+            if verbose:
+                print("🆕 NEW OBJECT MODE: Creating new DataFrame(s)")
+
+            deduplicated_dfs = []
+            total_duplicates_removed = 0
+            total_groups_found = 0
+
+            for i, df in enumerate(data):
+                try:
+                    original_rows = len(df)
+
+                    # Check if all specified columns exist
+                    missing_cols = [col for col in dup_cols if col not in df.columns]
+                    if missing_cols:
+                        if verbose:
+                            print(f"DataFrame {i}: Missing columns {missing_cols}. Available: {list(df.columns)}")
+                        deduplicated_dfs.append(df)
+                        continue
+
+                    # Analyze duplicates before removal
+                    dup_analysis = analyze_duplicates(df, dup_cols)
+                    if verbose:
+                        groups_in_df = dup_analysis['duplicate_groups_count']
+                        total_groups_found += groups_in_df
+                        print(f"DataFrame {i}: Found {groups_in_df} duplicate groups "
+                              f"({dup_analysis['total_duplicate_rows']} total duplicate rows)")
+
+                    # Remove duplicates and create new DataFrame
+                    deduplicated_df = remove_duplicates_single_df(df, dup_cols, keep, date_column)
+                    rows_removed = original_rows - len(deduplicated_df)
+                    total_duplicates_removed += rows_removed
+
+                    if verbose:
+                        print(f"DataFrame {i}: Original rows: {original_rows}, "
+                              f"Deduplicated rows: {len(deduplicated_df)}, Removed: {rows_removed}")
+
+                    deduplicated_dfs.append(deduplicated_df)
+
+                except Exception as e:
+                    if verbose:
+                        print(f"DataFrame {i}: Error removing duplicates - {e}")
+                    deduplicated_dfs.append(df)
+
+            # Final summary for new object mode
+            if verbose:
+                print(f"\n🎯 DUPLICATE REMOVAL SUMMARY:")
+                print(f"   📊 Total duplicate rows removed: {total_duplicates_removed}")
+                print(f"   🔍 Total duplicate groups found: {total_groups_found}")
+                if date_column:
+                    print(f"   📅 Using date column '{date_column}' - kept most recent rows")
+                if keep in ['none', False]:
+                    print(f"   🗑️  Removal mode: Removed ALL duplicate rows (keep none)")
+
+            return deduplicated_dfs[0] if single_df else deduplicated_dfs
+
+
+def merge_similar_dfs(
+        df1_input: Union[pd.DataFrame, List[pd.DataFrame]],
+        df2_input: Union[pd.DataFrame, List[pd.DataFrame]],
+        merge_column: str,
+        how: str = 'inner',
+        suffixes: Tuple[str, str] = None,
+        validate: str = None,
+        indicator: bool = None,
+        handle_duplicates: str = None,
+        handle_nan: str = None,
+        dtype_conversion: str = 'auto',
+        verbose: bool = True
+) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+    """
+    Merge two DataFrames or lists of DataFrames with comprehensive diagnostics and validation.
+
+    Parameters:
+    -----------
+    :param df1_input: First DataFrame or list of DataFrames to merge
+    :type df1_input: Union[pd.DataFrame, List[pd.DataFrame]]
+
+    :param df2_input: Second DataFrame or list of DataFrames to merge
+    :type df2_input: Union[pd.DataFrame, List[pd.DataFrame]]
+
+    :param merge_column: Column name to merge on
+    :type merge_column: str
+
+    :param how: Type of merge: 'inner', 'left', 'right', 'outer', 'cross' (default: 'inner')
+    :type how: str
+
+    :param suffixes: Suffixes to apply to overlapping columns (default: None - uses pandas defaults)
+    :type suffixes: Tuple[str, str]
+
+    :param validate: Check merge type: 'one_to_one', 'one_to_many', 'many_to_one', 'many_to_many' (default: None)
+    :type validate: str
+
+    :param indicator: Add _merge column showing source of each row (default: None - no indicator)
+    :type indicator: bool
+
+    :param handle_duplicates: How to handle duplicate merge keys: 'first', 'last', 'none', 'error' (default: None - no handling)
+    :type handle_duplicates: str
+
+    :param handle_nan: How to handle NaN values in merge column: 'drop', 'keep', 'error' (default: None - no handling)
+    :type handle_nan: str
+
+    :param dtype_conversion: Convert merge column dtypes: 'auto', 'string', 'numeric', 'none' (default: 'auto')
+    :type dtype_conversion: str
+
+    :param verbose: Whether to print progress messages (default: True)
+    :type verbose: bool
+
+    Returns:
+    --------
+    Union[pd.DataFrame, List[pd.DataFrame]]
+        Merged DataFrame(s) with comprehensive diagnostics
+    """
+
+    def preprocess_dataframe(df: pd.DataFrame, df_name: str, pair_idx: int = None) -> pd.DataFrame:
+        """Preprocess a single DataFrame for merging"""
+        df_clean = df.copy()
+
+        # Check if merge column exists
+        if merge_column not in df_clean.columns:
+            if verbose:
+                name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
+                print(
+                    f"{df_name}{name_suffix}: Merge column '{merge_column}' not found. Available: {list(df_clean.columns)}")
+            return None
+
+        # Handle NaN values in merge column (only if specified)
+        if handle_nan is not None:
+            nan_count = df_clean[merge_column].isna().sum()
+            if nan_count > 0:
+                if handle_nan == 'drop':
+                    if verbose:
+                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
+                        print(f"{df_name}{name_suffix}: Removing {nan_count} NaN values from merge column")
+                    df_clean = df_clean.dropna(subset=[merge_column])
+                elif handle_nan == 'error':
+                    raise ValueError(f"{df_name}: Found {nan_count} NaN values in merge column '{merge_column}'")
+
+        # Handle duplicates in merge column (only if specified)
+        if handle_duplicates is not None:
+            duplicate_count = df_clean.duplicated(subset=[merge_column]).sum()
+            if duplicate_count > 0:
+                if handle_duplicates == 'first':
+                    if verbose:
+                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
+                        print(
+                            f"{df_name}{name_suffix}: Removing {duplicate_count} duplicate merge keys (keeping first)")
+                    df_clean = df_clean.drop_duplicates(subset=[merge_column], keep='first')
+                elif handle_duplicates == 'last':
+                    if verbose:
+                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
+                        print(f"{df_name}{name_suffix}: Removing {duplicate_count} duplicate merge keys (keeping last)")
+                    df_clean = df_clean.drop_duplicates(subset=[merge_column], keep='last')
+                elif handle_duplicates == 'none':
+                    if verbose:
+                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
+                        print(f"{df_name}{name_suffix}: Removing {duplicate_count} duplicate merge keys (keeping none)")
+                    df_clean = df_clean.drop_duplicates(subset=[merge_column], keep=False)
+                elif handle_duplicates == 'error':
+                    raise ValueError(
+                        f"{df_name}: Found {duplicate_count} duplicate values in merge column '{merge_column}'")
+
+        return df_clean
+
+    def convert_dtypes(df1: pd.DataFrame, df2: pd.DataFrame, pair_idx: int = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Convert merge column dtypes to be compatible"""
+        if dtype_conversion == 'none':
+            return df1, df2
+
+        dtype1 = df1[merge_column].dtype
+        dtype2 = df2[merge_column].dtype
+
+        if dtype1 == dtype2:
+            return df1, df2
+
+        if dtype_conversion == 'auto':
+            # Convert to string if types are different
+            if verbose:
+                name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
+                print(f"Pair {pair_idx}: Converting merge column dtypes to string (was {dtype1} and {dtype2})")
+            df1[merge_column] = df1[merge_column].astype(str)
+            df2[merge_column] = df2[merge_column].astype(str)
+
+        elif dtype_conversion == 'string':
+            df1[merge_column] = df1[merge_column].astype(str)
+            df2[merge_column] = df2[merge_column].astype(str)
+
+        elif dtype_conversion == 'numeric':
+            # Try to convert both to numeric
+            df1[merge_column] = pd.to_numeric(df1[merge_column], errors='coerce')
+            df2[merge_column] = pd.to_numeric(df2[merge_column], errors='coerce')
+
+        return df1, df2
+
+    def calculate_expected_rows(df1: pd.DataFrame, df2: pd.DataFrame, merge_type: str) -> int:
+        """Calculate expected number of rows after merge"""
+        df1_unique = df1[merge_column].nunique()
+        df2_unique = df2[merge_column].nunique()
+        common_keys = set(df1[merge_column]) & set(df2[merge_column])
+        common_count = len(common_keys)
+
+        if merge_type == 'inner':
+            return common_count
+        elif merge_type == 'left':
+            return len(df1)
+        elif merge_type == 'right':
+            return len(df2)
+        elif merge_type == 'outer':
+            return len(df1) + len(df2) - common_count
+        elif merge_type == 'cross':
+            return len(df1) * len(df2)
+        else:
+            return -1  # Unknown merge type
+
+    def perform_single_merge(df1: pd.DataFrame, df2: pd.DataFrame, pair_idx: int = None) -> pd.DataFrame:
+        """Perform merge for a single pair of DataFrames"""
+        # Preprocess both DataFrames
+        df1_clean = preprocess_dataframe(df1, "DF1", pair_idx)
+        df2_clean = preprocess_dataframe(df2, "DF2", pair_idx)
+
+        if df1_clean is None or df2_clean is None:
+            if verbose:
+                print(f"Pair {pair_idx}: Skipping merge due to missing merge column")
+            return None
+
+        # Convert dtypes if needed
+        df1_clean, df2_clean = convert_dtypes(df1_clean, df2_clean, pair_idx)
+
+        # Pre-merge diagnostics
+        if verbose and pair_idx is not None:
+            df1_unique = df1_clean[merge_column].nunique()
+            df2_unique = df2_clean[merge_column].nunique()
+            common_keys = set(df1_clean[merge_column]) & set(df2_clean[merge_column])
+            common_count = len(common_keys)
+            expected_rows = calculate_expected_rows(df1_clean, df2_clean, how)
+
+            print(f"\n--- Pair {pair_idx} Merge Diagnostics ---")
+            print(f"DF1: {len(df1_clean)} rows, {df1_unique} unique {merge_column}")
+            print(f"DF2: {len(df2_clean)} rows, {df2_unique} unique {merge_column}")
+            print(f"Common {merge_column}: {common_count}")
+            print(f"Merge type: {how}")
+            print(f"Expected result rows: {expected_rows}")
+
+            # Report on preprocessing if any was done
+            if handle_nan is not None:
+                df1_nan = df1[merge_column].isna().sum() - df1_clean[merge_column].isna().sum()
+                df2_nan = df2[merge_column].isna().sum() - df2_clean[merge_column].isna().sum()
+                if df1_nan > 0 or df2_nan > 0:
+                    print(f"NaN handling: Removed {df1_nan} from DF1, {df2_nan} from DF2")
+
+            if handle_duplicates is not None:
+                df1_dup = len(df1) - len(df1_clean)
+                df2_dup = len(df2) - len(df2_clean)
+                if df1_dup > 0 or df2_dup > 0:
+                    print(f"Duplicate handling: Removed {df1_dup} from DF1, {df2_dup} from DF2")
+
+        # Perform the merge
+        try:
+            # Prepare merge arguments
+            merge_kwargs = {
+                'left': df1_clean,
+                'right': df2_clean,
+                'on': merge_column,
+                'how': how,
+                'validate': validate
+            }
+
+            # Only add suffixes if specified
+            if suffixes is not None:
+                merge_kwargs['suffixes'] = suffixes
+
+            # Only add indicator if specified
+            if indicator is not None:
+                merge_kwargs['indicator'] = indicator
+
+            merged_df = pd.merge(**merge_kwargs)
+
+            # Post-merge diagnostics
+            if verbose and pair_idx is not None:
+                actual_rows = len(merged_df)
+                print(f"Actual result rows: {actual_rows}")
+
+                if indicator:
+                    merge_stats = merged_df['_merge'].value_counts()
+                    print(f"Merge composition: {merge_stats.to_dict()}")
+
+                # Check for overlapping column names
+                overlapping_cols = set(df1_clean.columns) & set(df2_clean.columns) - {merge_column}
+                if overlapping_cols:
+                    if suffixes is not None:
+                        print(f"Overlapping columns (received suffixes {suffixes}): {list(overlapping_cols)}")
+                    else:
+                        print(f"Overlapping columns (using pandas defaults): {list(overlapping_cols)}")
+
+                if expected_rows != -1 and actual_rows != expected_rows:
+                    print(f"NOTE: Expected {expected_rows} rows but got {actual_rows} rows")
+
+                print(f"Pair {pair_idx}: Successfully merged. Shapes: {df1.shape} + {df2.shape} -> {merged_df.shape}")
+
+            return merged_df
 
         except Exception as e:
             if verbose:
-                print(f"DataFrame {i}: Error filtering rows - {e}")
-            filtered_dfs.append(df)
+                print(f"Pair {pair_idx}: Error during merge - {e}")
+            return None
+
+    # Main function logic
+    # Convert single DataFrames to lists for uniform processing
+    single_df_mode = False
+    if isinstance(df1_input, pd.DataFrame) and isinstance(df2_input, pd.DataFrame):
+        df_list1 = [df1_input]
+        df_list2 = [df2_input]
+        single_df_mode = True
+    elif isinstance(df1_input, list) and isinstance(df2_input, list):
+        df_list1 = df1_input
+        df_list2 = df2_input
+    else:
+        raise ValueError("Both inputs must be either DataFrames or lists of DataFrames")
+
+    # Handle different list lengths
+    if len(df_list1) != len(df_list2):
+        if verbose:
+            print(f"Warning: List lengths differ - list1: {len(df_list1)}, list2: {len(df_list2)}")
+        min_length = min(len(df_list1), len(df_list2))
+        df_list1 = df_list1[:min_length]
+        df_list2 = df_list2[:min_length]
+        if verbose:
+            print(f"Using first {min_length} pairs for merging")
+
+    if verbose:
+        print(f"🔗 MERGE CONFIGURATION:")
+        print(f"   📊 Input pairs: {len(df_list1)}")
+        print(f"   🎯 Merge column: '{merge_column}'")
+        print(f"   🔄 Merge type: {how}")
+        print(f"   📝 Suffixes: {suffixes} (pandas defaults)")
+        print(f"   ✅ Validate: {validate}")
+        print(f"   📈 Indicator: {indicator} (no indicator)")
+        print(f"   🔄 Duplicate handling: {handle_duplicates} (no handling)")
+        print(f"   🚫 NaN handling: {handle_nan} (no handling)")
+        print(f"   🔧 Dtype conversion: {dtype_conversion}")
+
+    merged_dfs = []
+    successful_merges = 0
+
+    for i, (df1, df2) in enumerate(zip(df_list1, df_list2)):
+        merged_df = perform_single_merge(df1, df2, i)
+        if merged_df is not None:
+            merged_dfs.append(merged_df)
+            successful_merges += 1
+        else:
+            # If merge fails, keep original DataFrames
+            if verbose:
+                print(f"Pair {i}: Merge failed, keeping original DataFrames")
+            merged_dfs.extend([df1, df2])
 
     # Final summary
     if verbose:
-        print(f"\n🎯 FILTERING SUMMARY:")
-        print(f"   📊 Total rows removed across all DataFrames: {total_rows_removed}")
-        if is_range:
-            print(f"   🔍 Filter criteria: Columns {columns} between {range_min} and {range_max}")
-        else:
-            print(f"   🔍 Filter criteria: Columns {columns} matching values {values}")
+        print(f"\n=== MERGE SUMMARY ===")
+        print(f"✅ Successful merges: {successful_merges}/{len(df_list1)}")
+        print(f"📊 Total output DataFrames: {len(merged_dfs)}")
 
-    return filtered_dfs[0] if single_df else filtered_dfs
+    # Return appropriate format
+    if single_df_mode and merged_dfs:
+        return merged_dfs[0]
+    else:
+        return merged_dfs
