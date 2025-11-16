@@ -6,6 +6,7 @@ import inspect
 import subprocess
 from typing import List, Union, Dict, Generator, Tuple, Callable, Any
 
+
 def read_large_file(file_path: str,
                     file_type: str = 'csv',
                     chunksize: int = 10000,
@@ -66,7 +67,69 @@ def read_large_file(file_path: str,
     import os
     import pandas as pd
     import json
+    import subprocess
     from typing import Union, Generator
+
+    # Git LFS Detection Function
+    def is_git_lfs_pointer(file_path: str) -> bool:
+        """Check if a file is a Git LFS pointer file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                first_line = f.readline().strip()
+                return first_line.startswith('version https://git-lfs.github.com/spec/v1')
+        except (UnicodeDecodeError, IOError):
+            return False
+
+    def handle_git_lfs_file(file_path: str) -> bool:
+        """Handle Git LFS pointer file by pulling actual content."""
+        if verbose:
+            print("Git LFS pointer detected. Attempting to pull actual file...")
+
+        try:
+            # Get repository root
+            repo_result = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                                         capture_output=True, text=True, check=True)
+            repo_root = repo_result.stdout.strip()
+
+            if verbose:
+                print(f"Repository root: {repo_root}")
+
+            # Check if LFS is installed
+            subprocess.run(['git', 'lfs', 'version'], capture_output=True, check=True)
+
+            # Pull LFS files
+            if verbose:
+                print("Running 'git lfs pull'...")
+
+            pull_result = subprocess.run(['git', 'lfs', 'pull'],
+                                         capture_output=True, text=True, check=True,
+                                         cwd=repo_root)
+
+            if verbose:
+                print("Git LFS pull completed successfully")
+                if pull_result.stdout:
+                    print(f"Pull output: {pull_result.stdout}")
+
+            # Verify the file is no longer a pointer
+            if not is_git_lfs_pointer(file_path):
+                if verbose:
+                    print("Git LFS file successfully downloaded")
+                return True
+            else:
+                if verbose:
+                    print("File is still a Git LFS pointer after pull")
+                return False
+
+        except subprocess.CalledProcessError as e:
+            if verbose:
+                print(f"Git LFS operation failed: {e}")
+                if e.stderr:
+                    print(f"Error details: {e.stderr}")
+            return False
+        except FileNotFoundError:
+            if verbose:
+                print("Git not found in PATH")
+            return False
 
     # Validate file type parameter
     if file_type not in ['csv', 'json']:
@@ -79,6 +142,21 @@ def read_large_file(file_path: str,
     # Enhanced file validation
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found at path: {file_path}")
+
+    # Git LFS handling
+    if is_git_lfs_pointer(file_path):
+        if auto_handle_lfs:
+            success = handle_git_lfs_file(file_path)
+            if not success:
+                raise IOError(
+                    f"Failed to automatically handle Git LFS file: {file_path}\n"
+                    f"Please run 'git lfs pull' manually or check Git LFS configuration."
+                )
+        else:
+            raise IOError(
+                f"File is a Git LFS pointer: {file_path}\n"
+                f"Set auto_handle_lfs=True to automatically download, or run 'git lfs pull' manually."
+            )
 
     if verbose:
         print(f"Reading {file_type.upper()} file from: {file_path}")
@@ -365,40 +443,66 @@ def read_large_file(file_path: str,
                     print(f"Warning: {bad_lines_count} bad lines were skipped")
 
         return chunk_generator()
-def check_and_pull_git_lfs():
+
+
+def check_and_pull_git_lfs(directory_path: str = None):
     """
     Check for Git LFS pointers and pull actual files if needed.
-    Returns True if pull was attempted/successful, False otherwise.
+
+    Parameters:
+    -----------
+    directory_path : str, optional
+        Specific directory path to run Git LFS operations from.
+        If None, uses the current working directory or git repository root.
+
+    Returns:
+    --------
+    bool
+        True if pull was attempted/successful, False otherwise.
     """
-    # Get the root directory of the git repository
-    try:
-        # Get the root directory of the git repo
-        result = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
-                                capture_output=True, text=True, check=True)
-        repo_root = result.stdout.strip()
+    import os
+    import subprocess
 
-        if not repo_root:
-            print("Not in a git repository")
+    # Determine the target directory for Git operations
+    if directory_path is not None:
+        # Use the specified directory
+        target_dir = os.path.abspath(directory_path)
+        if not os.path.exists(target_dir):
+            print(f"Specified directory does not exist: {target_dir}")
             return False
+        if not os.path.isdir(target_dir):
+            print(f"Specified path is not a directory: {target_dir}")
+            return False
+    else:
+        # Use git repository root or current directory
+        try:
+            # Get the root directory of the git repo
+            result = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                                    capture_output=True, text=True, check=True)
+            target_dir = result.stdout.strip()
+            if not target_dir:
+                print("Not in a git repository")
+                return False
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fall back to current directory if not in git repo
+            target_dir = os.getcwd()
+            print(f"Not in a git repository, using current directory: {target_dir}")
 
-        print(f"Git repository root: {repo_root}")
+    # Get current directory for context
+    current_dir = os.getcwd()
+    print(f"Target directory for LFS operations: {target_dir}")
+    print(f"Current working directory: {current_dir}")
 
-        # Get current directory for context
-        current_dir = os.getcwd()
-        print(f"Current working directory: {current_dir}")
-
-        # Check if we're already in the repo root
-        if current_dir != repo_root:
-            print(f"Note: Switching to repository root for LFS operations")
-
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Git not available or not in a git repository")
-        return False
+    # Check if we need to change directories
+    using_different_dir = current_dir != target_dir
+    if using_different_dir:
+        print(f"Note: Using specified directory for LFS operations")
 
     # Check if LFS is installed
     try:
         lfs_version_result = subprocess.run(['git', 'lfs', 'version'],
-                                            capture_output=True, text=True, check=True)
+                                            capture_output=True, text=True, check=True,
+                                            cwd=target_dir)
         print(f"Git LFS version: {lfs_version_result.stdout.strip()}")
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Git LFS is not installed. Please install Git LFS first.")
@@ -406,29 +510,30 @@ def check_and_pull_git_lfs():
 
     # Check if there are LFS files that need pulling
     try:
-        print("Checking LFS status in repository root...")
+        print(f"Checking LFS status in target directory...")
         lfs_status = subprocess.run(['git', 'lfs', 'status'],
                                     capture_output=True, text=True, check=True,
-                                    cwd=repo_root)
+                                    cwd=target_dir)
 
         print("LFS Status Output:")
         print(lfs_status.stdout)
 
         if "to be downloaded" in lfs_status.stdout:
-            print("\nGit LFS files need downloading. Running 'git lfs pull' from repository root...")
+            print(f"\nGit LFS files need downloading. Running 'git lfs pull' from target directory...")
 
-            # Actually pull the LFS files from repository root
+            # Actually pull the LFS files from target directory
             pull_result = subprocess.run(['git', 'lfs', 'pull'],
                                          capture_output=True, text=True, check=True,
-                                         cwd=repo_root)
+                                         cwd=target_dir)
 
             print("Git LFS pull completed successfully!")
-            print(f"Pull output: {pull_result.stdout}")
+            if pull_result.stdout:
+                print(f"Pull output: {pull_result.stdout}")
 
             # Verify the pull worked by checking status again
             verify_status = subprocess.run(['git', 'lfs', 'status'],
                                            capture_output=True, text=True, check=True,
-                                           cwd=repo_root)
+                                           cwd=target_dir)
             print("Post-pull LFS status:")
             print(verify_status.stdout)
 
@@ -442,7 +547,6 @@ def check_and_pull_git_lfs():
         if e.stderr:
             print(f"Error details: {e.stderr}")
         return False
-
 def save_df_list_to_csv_auto(df_list, directory_path, df_dict=None):
     """
     Save DataFrame list with automatic variable name detection.
@@ -1892,59 +1996,337 @@ def concatenate_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
 def coalesce_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                      columns: Union[List[str], Tuple[str, str]],
                      new_column_name: str = None,
-                     conflict_resolution: str = 'coalesce') -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                     conflict_resolution: str = 'coalesce',
+                     inplace: bool = True,
+                     numeric_priority: str = None) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
-    Coalesce multiple columns - take first non-null value.
+    Coalesce multiple columns - take first non-null value and remove only the merged columns.
+    Supports taking lowest/highest numeric values when specified.
 
     Parameters:
     -----------
     :param dataframes: Input DataFrame or list of DataFrames to process
     :type dataframes: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param columns: Column name(s) to coalesce
     :type columns: Union[List[str], Tuple[str, str]]
-    
-    :param new_column_name: Name for the coalesced column (default: None)
+
+    :param new_column_name: Name for the coalesced column (default: None - uses first column name)
     :type new_column_name: str
-    
+
     :param conflict_resolution: How to handle conflicts (default: 'coalesce')
+                               Options: 'coalesce', 'first', 'last', 'min', 'max'
     :type conflict_resolution: str
+
+    :param inplace: If True, modifies the original DataFrame(s) in place (default: True)
+    :type inplace: bool
+
+    :param numeric_priority: Priority for numeric values when multiple non-null values exist
+                            Options: 'lowest', 'highest', None (default: None)
+    :type numeric_priority: str
 
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - New column containing first non-null values from input columns
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=True: None (original DataFrame(s) are modified in place)
+        - If inplace=False: New DataFrame(s) with coalesced columns
     """
-    return merge_columns(dataframes, columns, new_column_name, 'coalesce', conflict_resolution=conflict_resolution)
 
+    def coalesce_single_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Convert columns to list if needed
+        if isinstance(columns, tuple):
+            col_list = list(columns)
+        else:
+            col_list = columns.copy()
+
+        # Set default new column name if not provided
+        if new_column_name is None:
+            new_column_name_final = col_list[0]
+        else:
+            new_column_name_final = new_column_name
+
+        # Check which columns actually exist in this DataFrame
+        existing_columns = [col for col in col_list if col in df.columns]
+
+        if not existing_columns:
+            print(f"Warning: None of the columns {col_list} found in DataFrame")
+            return df
+
+        # Create a copy to avoid modifying the original during processing
+        df_result = df.copy()
+
+        if len(existing_columns) == 1:
+            # If only one column exists, just rename it if needed
+            if existing_columns[0] != new_column_name_final:
+                df_result = df_result.rename(columns={existing_columns[0]: new_column_name_final})
+        else:
+            # Handle different conflict resolution strategies
+            if conflict_resolution == 'coalesce' and numeric_priority is None:
+                # Original coalesce behavior: take first non-null value
+                df_result[new_column_name_final] = df_result[existing_columns[0]]
+                for col in existing_columns[1:]:
+                    mask = df_result[new_column_name_final].isna()
+                    df_result.loc[mask, new_column_name_final] = df_result.loc[mask, col]
+
+            elif conflict_resolution == 'first':
+                # Take first non-null value (same as coalesce)
+                df_result[new_column_name_final] = df_result[existing_columns[0]]
+                for col in existing_columns[1:]:
+                    mask = df_result[new_column_name_final].isna()
+                    df_result.loc[mask, new_column_name_final] = df_result.loc[mask, col]
+
+            elif conflict_resolution == 'last':
+                # Take last non-null value (reverse order)
+                df_result[new_column_name_final] = df_result[existing_columns[-1]]
+                for col in reversed(existing_columns[:-1]):
+                    mask = df_result[new_column_name_final].isna()
+                    df_result.loc[mask, new_column_name_final] = df_result.loc[mask, col]
+
+            elif conflict_resolution in ['min', 'max'] or numeric_priority in ['lowest', 'highest']:
+                # Handle numeric priority - take lowest or highest value
+                df_result[new_column_name_final] = None
+
+                # Determine the actual priority to use
+                actual_priority = numeric_priority
+                if conflict_resolution in ['min', 'max']:
+                    actual_priority = 'lowest' if conflict_resolution == 'min' else 'highest'
+
+                for idx in df_result.index:
+                    # Get all non-null values for this row from the specified columns
+                    row_values = []
+                    for col in existing_columns:
+                        val = df_result.at[idx, col]
+                        if pd.notna(val):
+                            row_values.append(val)
+
+                    if not row_values:
+                        # All values are NaN, keep as NaN
+                        continue
+
+                    if actual_priority == 'lowest':
+                        # Take the smallest numeric value
+                        try:
+                            # Convert to numeric and find min
+                            numeric_vals = [pd.to_numeric(val, errors='coerce') for val in row_values]
+                            valid_numeric = [val for val in numeric_vals if pd.notna(val)]
+                            if valid_numeric:
+                                min_val = min(valid_numeric)
+                                # Find the original value that corresponds to this numeric value
+                                # Prefer the first occurrence that matches the min numeric value
+                                for i, (orig_val, num_val) in enumerate(zip(row_values, numeric_vals)):
+                                    if pd.notna(num_val) and num_val == min_val:
+                                        df_result.at[idx, new_column_name_final] = orig_val
+                                        break
+                            else:
+                                # No valid numeric values, take first non-null
+                                df_result.at[idx, new_column_name_final] = row_values[0]
+                        except (ValueError, TypeError):
+                            # If conversion fails, take first non-null value
+                            df_result.at[idx, new_column_name_final] = row_values[0]
+
+                    elif actual_priority == 'highest':
+                        # Take the largest numeric value
+                        try:
+                            # Convert to numeric and find max
+                            numeric_vals = [pd.to_numeric(val, errors='coerce') for val in row_values]
+                            valid_numeric = [val for val in numeric_vals if pd.notna(val)]
+                            if valid_numeric:
+                                max_val = max(valid_numeric)
+                                # Find the original value that corresponds to this max numeric value
+                                for i, (orig_val, num_val) in enumerate(zip(row_values, numeric_vals)):
+                                    if pd.notna(num_val) and num_val == max_val:
+                                        df_result.at[idx, new_column_name_final] = orig_val
+                                        break
+                            else:
+                                # No valid numeric values, take first non-null
+                                df_result.at[idx, new_column_name_final] = row_values[0]
+                        except (ValueError, TypeError):
+                            # If conversion fails, take first non-null value
+                            df_result.at[idx, new_column_name_final] = row_values[0]
+
+            else:
+                # Default to coalesce behavior
+                df_result[new_column_name_final] = df_result[existing_columns[0]]
+                for col in existing_columns[1:]:
+                    mask = df_result[new_column_name_final].isna()
+                    df_result.loc[mask, new_column_name_final] = df_result.loc[mask, col]
+
+            # Remove only the columns that were merged (keep all other columns)
+            # Don't remove the column if it's the same as the new column name
+            columns_to_remove = [col for col in existing_columns if col != new_column_name_final]
+            df_result = df_result.drop(columns=columns_to_remove)
+
+        return df_result
+
+    # Handle inplace operation
+    if inplace:
+        # Convert single DataFrame to list for uniform processing
+        if isinstance(dataframes, pd.DataFrame):
+            dataframes_list = [dataframes]
+            single_df = True
+        else:
+            dataframes_list = dataframes
+            single_df = False
+
+        # Modify DataFrames in place
+        for i, df in enumerate(dataframes_list):
+            try:
+                original_columns = list(df.columns)
+                result_df = coalesce_single_df(df)
+
+                # Clear original DataFrame and replace with result (keeping all columns)
+                df.drop(df.index, inplace=True)
+                df.drop(df.columns, axis=1, inplace=True)
+
+                # Copy all columns (including non-merged ones) back to original DataFrame
+                for col in result_df.columns:
+                    df[col] = result_df[col]
+
+                # Get the list of columns that were actually removed
+                removed_columns = [col for col in original_columns if col not in df.columns]
+                if removed_columns:
+                    priority_info = ""
+                    if numeric_priority:
+                        priority_info = f" with {numeric_priority} value priority"
+                    elif conflict_resolution in ['min', 'max']:
+                        priority_info = f" with {conflict_resolution} value"
+
+                    print(
+                        f"Coalesced columns {removed_columns} -> '{new_column_name or columns[0]}'{priority_info} in DataFrame {i}")
+                else:
+                    print(f"Renamed column to '{new_column_name or columns[0]}' in DataFrame {i}")
+
+            except Exception as e:
+                print(f"Error processing DataFrame {i}: {e}")
+
+        return None  # Inplace operations return None
+
+    else:
+        # Return new DataFrame(s)
+        if isinstance(dataframes, pd.DataFrame):
+            return coalesce_single_df(dataframes)
+        elif isinstance(dataframes, list):
+            return [coalesce_single_df(df) for df in dataframes]
+        else:
+            raise ValueError("dataframes must be a DataFrame or list of DataFrames")
 
 def sum_columns(dataframes: Union[pd.DataFrame, List[pd.DataFrame]],
                 columns: Union[List[str], Tuple[str, str]],
-                new_column_name: str = None) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+                new_column_name: str = None,
+                inplace: bool = True) -> Union[pd.DataFrame, List[pd.DataFrame], None]:
     """
-    Sum values from numeric columns.
+    Sum values from numeric columns and remove only the summed columns.
 
     Parameters:
     -----------
     :param dataframes: Input DataFrame or list of DataFrames to process
     :type dataframes: Union[pd.DataFrame, List[pd.DataFrame]]
-    
+
     :param columns: Numeric column name(s) to sum
     :type columns: Union[List[str], Tuple[str, str]]
-    
-    :param new_column_name: Name for the summed column (default: None)
+
+    :param new_column_name: Name for the summed column (default: None - uses 'sum_of_columns')
     :type new_column_name: str
+
+    :param inplace: If True, modifies the original DataFrame(s) in place (default: True)
+    :type inplace: bool
 
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Processed DataFrame(s) with:
-        - New column containing sum of values from input columns
+    Union[pd.DataFrame, List[pd.DataFrame], None]
+        - If inplace=True: None (original DataFrame(s) are modified in place)
+        - If inplace=False: New DataFrame(s) with summed columns
     """
-    return merge_columns(dataframes, columns, new_column_name, 'sum')
 
+    def sum_single_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Convert columns to list if needed
+        if isinstance(columns, tuple):
+            col_list = list(columns)
+        else:
+            col_list = columns.copy()
 
+        # Set default new column name if not provided
+        if new_column_name is None:
+            new_column_name_final = f"sum_of_{'_'.join(col_list)}"
+        else:
+            new_column_name_final = new_column_name
+
+        # Check which columns actually exist in this DataFrame
+        existing_columns = [col for col in col_list if col in df.columns]
+
+        if not existing_columns:
+            print(f"Warning: None of the columns {col_list} found in DataFrame")
+            return df
+
+        # Create a copy to avoid modifying the original during processing
+        df_result = df.copy()
+
+        if len(existing_columns) == 1:
+            # If only one column exists, just rename it if needed
+            if existing_columns[0] != new_column_name_final:
+                df_result = df_result.rename(columns={existing_columns[0]: new_column_name_final})
+            # No columns to remove since we only have one and we're keeping it (possibly renamed)
+        else:
+            # Sum the numeric columns
+            df_result[new_column_name_final] = 0
+
+            for col in existing_columns:
+                # Convert to numeric, coercing errors to NaN
+                numeric_values = pd.to_numeric(df_result[col], errors='coerce')
+                df_result[new_column_name_final] += numeric_values.fillna(0)
+
+            # Remove only the columns that were summed (keep all other columns)
+            # Don't remove the column if it's the same as the new column name
+            columns_to_remove = [col for col in existing_columns if col != new_column_name_final]
+            df_result = df_result.drop(columns=columns_to_remove)
+
+        return df_result
+
+    # Handle inplace operation
+    if inplace:
+        # Convert single DataFrame to list for uniform processing
+        if isinstance(dataframes, pd.DataFrame):
+            dataframes_list = [dataframes]
+            single_df = True
+        else:
+            dataframes_list = dataframes
+            single_df = False
+
+        # Modify DataFrames in place
+        for i, df in enumerate(dataframes_list):
+            try:
+                original_columns = list(df.columns)
+                result_df = sum_single_df(df)
+
+                # Clear original DataFrame and replace with result (keeping all columns)
+                df.drop(df.index, inplace=True)
+                df.drop(df.columns, axis=1, inplace=True)
+
+                # Copy all columns (including non-summed ones) back to original DataFrame
+                for col in result_df.columns:
+                    df[col] = result_df[col]
+
+                # Get the list of columns that were actually removed
+                removed_columns = [col for col in original_columns if col not in df.columns]
+                if removed_columns:
+                    print(
+                        f"Summed columns {removed_columns} -> '{new_column_name or f'sum_of_{columns[0]}'}' in DataFrame {i}")
+                else:
+                    print(f"Renamed column to '{new_column_name or f'sum_of_{columns[0]}'}' in DataFrame {i}")
+
+            except Exception as e:
+                print(f"Error processing DataFrame {i}: {e}")
+
+        return None  # Inplace operations return None
+
+    else:
+        # Return new DataFrame(s)
+        if isinstance(dataframes, pd.DataFrame):
+            return sum_single_df(dataframes)
+        elif isinstance(dataframes, list):
+            return [sum_single_df(df) for df in dataframes]
+        else:
+            raise ValueError("dataframes must be a DataFrame or list of DataFrames")
 def filter_rows_by_value(
         data: Union[pd.DataFrame, List[pd.DataFrame]],
         column: Union[str, List[str], Dict[str, Union[Any, List[Any], Tuple[Any, Any]]]],
