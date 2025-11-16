@@ -4,7 +4,7 @@ import numpy as np
 import logging
 import inspect
 import subprocess
-from typing import List, Union, Dict, Generator, Tuple, Callable, Any
+from typing import List, Union, Dict, Generator, Tuple, Callable, Any, Optional
 
 
 def read_large_file(file_path: str,
@@ -2899,312 +2899,352 @@ def remove_duplicate_rows(
             return deduplicated_dfs[0] if single_df else deduplicated_dfs
 
 
-def merge_similar_dfs(
-        df1_input: Union[pd.DataFrame, List[pd.DataFrame]],
-        df2_input: Union[pd.DataFrame, List[pd.DataFrame]],
-        merge_column: str,
-        how: str = 'inner',
-        suffixes: Tuple[str, str] = None,
-        validate: str = None,
-        indicator: bool = None,
-        handle_duplicates: str = None,
-        handle_nan: str = None,
-        dtype_conversion: str = 'auto',
-        verbose: bool = True
-) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+from typing import Union, List, Dict, Any, Optional
+import pandas as pd
+import numpy as np
+
+
+def create_variable_eval(dataframes: Union[pd.DataFrame, List, List[List]],
+                         new_column_name: str,
+                         formula: str,
+                         inplace: bool = True,
+                         fill_na: Optional[Union[float, int, str]] = None,
+                         fill_na_method: Optional[str] = None,
+                         verbose: bool = True) -> Union[Dict[str, Any], List[pd.DataFrame], pd.DataFrame, None]:
     """
-    Merge two DataFrames or lists of DataFrames with comprehensive diagnostics and validation.
+    Create new variables in DataFrames using pandas eval() for flexible formula operations.
+    Supports both in-place modification and returning new DataFrames.
+
+    This function can handle single DataFrames, lists of DataFrames, or nested list structures.
+    It uses pandas eval() which supports arithmetic operations, comparisons, and column references.
 
     Parameters:
     -----------
-    :param df1_input: First DataFrame or list of DataFrames to merge
-    :type df1_input: Union[pd.DataFrame, List[pd.DataFrame]]
+    dataframes : Union[pd.DataFrame, List, List[List]]
+        Input DataFrame(s) to process. Can be:
+        - Single pandas DataFrame
+        - List of pandas DataFrames
+        - Nested list of pandas DataFrames (e.g., [[df1, df2], [df3, df4]])
+        Any non-DataFrame items in lists will be skipped with a warning.
 
-    :param df2_input: Second DataFrame or list of DataFrames to merge
-    :type df2_input: Union[pd.DataFrame, List[pd.DataFrame]]
+    new_column_name : str
+        Name for the new column that will be created in all DataFrames.
+        If the column already exists, it will be overwritten when inplace=True.
 
-    :param merge_column: Column name to merge on
-    :type merge_column: str
+    formula : str
+        Formula expression using pandas eval() syntax. Supports:
+        - Arithmetic: +, -, *, /, **, //, %
+        - Comparisons: >, <, >=, <=, ==, !=
+        - Logical: & (and), | (or), ~ (not)
+        - Column names as variables (including columns with spaces using backticks)
+        - Parentheses for grouping
 
-    :param how: Type of merge: 'inner', 'left', 'right', 'outer', 'cross' (default: 'inner')
-    :type how: str
+    inplace : bool, default=True
+        If True, modifies the original DataFrame(s) in place and returns the results dictionary.
+        If False, returns new DataFrame(s) with the added column and does not modify originals.
 
-    :param suffixes: Suffixes to apply to overlapping columns (default: None - uses pandas defaults)
-    :type suffixes: Tuple[str, str]
+    fill_na : Optional[Union[float, int, str]], default=None
+        Value to use for filling NaN values in the source columns before applying the formula.
+        If provided, automatically adds .fillna(value) to each column in the formula.
+        Examples: 0, 0.0, 'missing', etc.
+        Cannot be used with fill_na_method.
 
-    :param validate: Check merge type: 'one_to_one', 'one_to_many', 'many_to_one', 'many_to_many' (default: None)
-    :type validate: str
+    fill_na_method : Optional[str], default=None
+        Method for filling NaN values. Options: 'ffill', 'bfill', 'mean', 'median'.
+        If provided, automatically adds the corresponding fill method to each column.
+        - 'ffill': Forward fill
+        - 'bfill': Backward fill
+        - 'mean': Fill with column mean
+        - 'median': Fill with column median
+        Cannot be used with fill_na.
 
-    :param indicator: Add _merge column showing source of each row (default: None - no indicator)
-    :type indicator: bool
-
-    :param handle_duplicates: How to handle duplicate merge keys: 'first', 'last', 'none', 'error' (default: None - no handling)
-    :type handle_duplicates: str
-
-    :param handle_nan: How to handle NaN values in merge column: 'drop', 'keep', 'error' (default: None - no handling)
-    :type handle_nan: str
-
-    :param dtype_conversion: Convert merge column dtypes: 'auto', 'string', 'numeric', 'none' (default: 'auto')
-    :type dtype_conversion: str
-
-    :param verbose: Whether to print progress messages (default: True)
-    :type verbose: bool
+    verbose : bool, default=True
+        If True, prints progress messages and summary.
+        If False, runs silently and only returns the results.
 
     Returns:
     --------
-    Union[pd.DataFrame, List[pd.DataFrame]]
-        Merged DataFrame(s) with comprehensive diagnostics
+    Union[Dict[str, Any], List[pd.DataFrame], pd.DataFrame, None]
+        The return type depends on inplace parameter and input structure:
+
+        - If inplace=True: Returns Dict[str, Any] with operation results
+        - If inplace=False:
+            - Returns single DataFrame if input was single DataFrame
+            - Returns list of DataFrames if input was list or nested list
+            - Returns None if no DataFrames were processed
+
+        Results dictionary contains:
+        - 'total_processed': Total number of DataFrames processed
+        - 'successful': Number of DataFrames successfully modified
+        - 'failed': Number of DataFrames that failed
+        - 'errors': List of error messages for failed operations
+        - 'formula_used': The actual formula applied (after NaN handling modifications)
+
+    Raises:
+    -------
+    ValueError
+        If both fill_na and fill_na_method are provided
+        If fill_na_method is not one of the allowed options
+
+    Notes:
+    ------
+    - When inplace=True, the function modifies DataFrames IN PLACE and returns results dictionary
+    - When inplace=False, the function returns NEW DataFrames and leaves originals unchanged
+    - NaN values in formulas will propagate by default (e.g., 5 + NaN = NaN)
+    - Use fill_na or fill_na_method parameters to handle missing data automatically
+    - Columns with spaces in names must be wrapped in backticks in the formula: `column name`
+    - String operations have limited support in eval()
+
+    Examples:
+    ---------
+    >>> # Columns with spaces using backticks
+    >>> result = create_variable_eval(df, 'total_sales', '`Q1 Sales` + `Q2 Sales`')
+    >>>
+    >>> # Mixed column names
+    >>> result = create_variable_eval(df, 'bmi', '`Weight (kg)` / (`Height (m)` ** 2)')
+    >>>
+    >>> # Complex formula with spaces
+    >>> result = create_variable_eval(
+    ...     df, 'bonus', '`Base Salary` * (`Performance Score` / 100)'
+    ... )
+
+    See Also:
+    ---------
+    pandas.DataFrame.eval : Underlying method used for formula evaluation
+    pandas.DataFrame.fillna : Method used for NaN replacement
     """
 
-    def preprocess_dataframe(df: pd.DataFrame, df_name: str, pair_idx: int = None) -> pd.DataFrame:
-        """Preprocess a single DataFrame for merging"""
-        df_clean = df.copy()
+    # Validate parameters
+    if fill_na is not None and fill_na_method is not None:
+        raise ValueError("Cannot use both fill_na and fill_na_method. Choose one.")
 
-        # Check if merge column exists
-        if merge_column not in df_clean.columns:
-            if verbose:
-                name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
-                print(
-                    f"{df_name}{name_suffix}: Merge column '{merge_column}' not found. Available: {list(df_clean.columns)}")
-            return None
+    if fill_na_method is not None and fill_na_method not in ['ffill', 'bfill', 'mean', 'median']:
+        raise ValueError(f"fill_na_method must be one of ['ffill', 'bfill', 'mean', 'median']. Got: {fill_na_method}")
 
-        # Handle NaN values in merge column (only if specified)
-        if handle_nan is not None:
-            nan_count = df_clean[merge_column].isna().sum()
-            if nan_count > 0:
-                if handle_nan == 'drop':
-                    if verbose:
-                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
-                        print(f"{df_name}{name_suffix}: Removing {nan_count} NaN values from merge column")
-                    df_clean = df_clean.dropna(subset=[merge_column])
-                elif handle_nan == 'error':
-                    raise ValueError(f"{df_name}: Found {nan_count} NaN values in merge column '{merge_column}'")
+    results = {
+        'total_processed': 0,
+        'successful': 0,
+        'failed': 0,
+        'errors': [],
+        'formula_used': formula,  # Track the final formula used
+        'inplace': inplace
+    }
 
-        # Handle duplicates in merge column (only if specified)
-        if handle_duplicates is not None:
-            duplicate_count = df_clean.duplicated(subset=[merge_column]).sum()
-            if duplicate_count > 0:
-                if handle_duplicates == 'first':
-                    if verbose:
-                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
-                        print(
-                            f"{df_name}{name_suffix}: Removing {duplicate_count} duplicate merge keys (keeping first)")
-                    df_clean = df_clean.drop_duplicates(subset=[merge_column], keep='first')
-                elif handle_duplicates == 'last':
-                    if verbose:
-                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
-                        print(f"{df_name}{name_suffix}: Removing {duplicate_count} duplicate merge keys (keeping last)")
-                    df_clean = df_clean.drop_duplicates(subset=[merge_column], keep='last')
-                elif handle_duplicates == 'none':
-                    if verbose:
-                        name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
-                        print(f"{df_name}{name_suffix}: Removing {duplicate_count} duplicate merge keys (keeping none)")
-                    df_clean = df_clean.drop_duplicates(subset=[merge_column], keep=False)
-                elif handle_duplicates == 'error':
-                    raise ValueError(
-                        f"{df_name}: Found {duplicate_count} duplicate values in merge column '{merge_column}'")
+    def extract_column_names(formula: str, df_columns: List[str]) -> List[str]:
+        """
+        Extract column names from formula, handling both regular and backtick-wrapped names.
+        """
+        import re
 
-        return df_clean
+        # Find all backtick-wrapped column names
+        backtick_columns = re.findall(r'`([^`]+)`', formula)
 
-    def convert_dtypes(df1: pd.DataFrame, df2: pd.DataFrame, pair_idx: int = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Convert merge column dtypes to be compatible"""
-        if dtype_conversion == 'none':
-            return df1, df2
+        # Find regular column names (valid Python identifiers)
+        regular_columns = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', formula)
 
-        dtype1 = df1[merge_column].dtype
-        dtype2 = df2[merge_column].dtype
+        # Remove Python keywords from regular columns
+        python_keywords = {'and', 'or', 'not', 'True', 'False', 'None', 'if', 'else', 'for', 'while'}
+        regular_columns = [col for col in regular_columns if col not in python_keywords]
 
-        if dtype1 == dtype2:
-            return df1, df2
+        # Combine and filter to columns that exist in the DataFrame
+        all_columns = backtick_columns + regular_columns
+        existing_columns = [col for col in all_columns if col in df_columns]
 
-        if dtype_conversion == 'auto':
-            # Convert to string if types are different
-            if verbose:
-                name_suffix = f" in pair {pair_idx}" if pair_idx is not None else ""
-                print(f"Pair {pair_idx}: Converting merge column dtypes to string (was {dtype1} and {dtype2})")
-            df1[merge_column] = df1[merge_column].astype(str)
-            df2[merge_column] = df2[merge_column].astype(str)
+        return existing_columns
 
-        elif dtype_conversion == 'string':
-            df1[merge_column] = df1[merge_column].astype(str)
-            df2[merge_column] = df2[merge_column].astype(str)
+    def process_nan_handling(original_formula: str, df: pd.DataFrame) -> str:
+        """
+        Modify formula to include NaN handling based on parameters.
+        Handles both regular column names and backtick-wrapped names.
+        """
+        if fill_na is None and fill_na_method is None:
+            return original_formula
 
-        elif dtype_conversion == 'numeric':
-            # Try to convert both to numeric
-            df1[merge_column] = pd.to_numeric(df1[merge_column], errors='coerce')
-            df2[merge_column] = pd.to_numeric(df2[merge_column], errors='coerce')
+        # Extract column names from formula
+        columns = extract_column_names(original_formula, list(df.columns))
 
-        return df1, df2
+        if not columns:
+            return original_formula
 
-    def calculate_expected_rows(df1: pd.DataFrame, df2: pd.DataFrame, merge_type: str) -> int:
-        """Calculate expected number of rows after merge"""
-        df1_unique = df1[merge_column].nunique()
-        df2_unique = df2[merge_column].nunique()
-        common_keys = set(df1[merge_column]) & set(df2[merge_column])
-        common_count = len(common_keys)
+        modified_formula = original_formula
 
-        if merge_type == 'inner':
-            return common_count
-        elif merge_type == 'left':
-            return len(df1)
-        elif merge_type == 'right':
-            return len(df2)
-        elif merge_type == 'outer':
-            return len(df1) + len(df2) - common_count
-        elif merge_type == 'cross':
-            return len(df1) * len(df2)
-        else:
-            return -1  # Unknown merge type
-
-    def perform_single_merge(df1: pd.DataFrame, df2: pd.DataFrame, pair_idx: int = None) -> pd.DataFrame:
-        """Perform merge for a single pair of DataFrames"""
-        # Preprocess both DataFrames
-        df1_clean = preprocess_dataframe(df1, "DF1", pair_idx)
-        df2_clean = preprocess_dataframe(df2, "DF2", pair_idx)
-
-        if df1_clean is None or df2_clean is None:
-            if verbose:
-                print(f"Pair {pair_idx}: Skipping merge due to missing merge column")
-            return None
-
-        # Convert dtypes if needed
-        df1_clean, df2_clean = convert_dtypes(df1_clean, df2_clean, pair_idx)
-
-        # Pre-merge diagnostics
-        if verbose and pair_idx is not None:
-            df1_unique = df1_clean[merge_column].nunique()
-            df2_unique = df2_clean[merge_column].nunique()
-            common_keys = set(df1_clean[merge_column]) & set(df2_clean[merge_column])
-            common_count = len(common_keys)
-            expected_rows = calculate_expected_rows(df1_clean, df2_clean, how)
-
-            print(f"\n--- Pair {pair_idx} Merge Diagnostics ---")
-            print(f"DF1: {len(df1_clean)} rows, {df1_unique} unique {merge_column}")
-            print(f"DF2: {len(df2_clean)} rows, {df2_unique} unique {merge_column}")
-            print(f"Common {merge_column}: {common_count}")
-            print(f"Merge type: {how}")
-            print(f"Expected result rows: {expected_rows}")
-
-            # Report on preprocessing if any was done
-            if handle_nan is not None:
-                df1_nan = df1[merge_column].isna().sum() - df1_clean[merge_column].isna().sum()
-                df2_nan = df2[merge_column].isna().sum() - df2_clean[merge_column].isna().sum()
-                if df1_nan > 0 or df2_nan > 0:
-                    print(f"NaN handling: Removed {df1_nan} from DF1, {df2_nan} from DF2")
-
-            if handle_duplicates is not None:
-                df1_dup = len(df1) - len(df1_clean)
-                df2_dup = len(df2) - len(df2_clean)
-                if df1_dup > 0 or df2_dup > 0:
-                    print(f"Duplicate handling: Removed {df1_dup} from DF1, {df2_dup} from DF2")
-
-        # Perform the merge
-        try:
-            # Prepare merge arguments
-            merge_kwargs = {
-                'left': df1_clean,
-                'right': df2_clean,
-                'on': merge_column,
-                'how': how,
-                'validate': validate
-            }
-
-            # Only add suffixes if specified
-            if suffixes is not None:
-                merge_kwargs['suffixes'] = suffixes
-
-            # Only add indicator if specified
-            if indicator is not None:
-                merge_kwargs['indicator'] = indicator
-
-            merged_df = pd.merge(**merge_kwargs)
-
-            # Post-merge diagnostics
-            if verbose and pair_idx is not None:
-                actual_rows = len(merged_df)
-                print(f"Actual result rows: {actual_rows}")
-
-                if indicator:
-                    merge_stats = merged_df['_merge'].value_counts()
-                    print(f"Merge composition: {merge_stats.to_dict()}")
-
-                # Check for overlapping column names
-                overlapping_cols = set(df1_clean.columns) & set(df2_clean.columns) - {merge_column}
-                if overlapping_cols:
-                    if suffixes is not None:
-                        print(f"Overlapping columns (received suffixes {suffixes}): {list(overlapping_cols)}")
+        for col in columns:
+            # Determine if the column is wrapped in backticks in the formula
+            if f'`{col}`' in original_formula:
+                # Column is backtick-wrapped
+                col_ref = f'`{col}`'
+                if fill_na is not None:
+                    if isinstance(fill_na, str):
+                        replacement = f'`{col}`.fillna(\'{fill_na}\')'
                     else:
-                        print(f"Overlapping columns (using pandas defaults): {list(overlapping_cols)}")
+                        replacement = f'`{col}`.fillna({fill_na})'
+                elif fill_na_method == 'ffill':
+                    replacement = f'`{col}`.ffill()'
+                elif fill_na_method == 'bfill':
+                    replacement = f'`{col}`.bfill()'
+                elif fill_na_method == 'mean':
+                    replacement = f'`{col}`.fillna({df[col].mean()})'
+                elif fill_na_method == 'median':
+                    replacement = f'`{col}`.fillna({df[col].median()})'
+                else:
+                    replacement = col_ref
+            else:
+                # Regular column name
+                col_ref = col
+                if fill_na is not None:
+                    if isinstance(fill_na, str):
+                        replacement = f'{col}.fillna(\'{fill_na}\')'
+                    else:
+                        replacement = f'{col}.fillna({fill_na})'
+                elif fill_na_method == 'ffill':
+                    replacement = f'{col}.ffill()'
+                elif fill_na_method == 'bfill':
+                    replacement = f'{col}.bfill()'
+                elif fill_na_method == 'mean':
+                    replacement = f'{col}.fillna({df[col].mean()})'
+                elif fill_na_method == 'median':
+                    replacement = f'{col}.fillna({df[col].median()})'
+                else:
+                    replacement = col_ref
 
-                if expected_rows != -1 and actual_rows != expected_rows:
-                    print(f"NOTE: Expected {expected_rows} rows but got {actual_rows} rows")
+            # Replace the column reference in the formula
+            # Use exact matching for backtick-wrapped columns
+            if f'`{col}`' in modified_formula:
+                modified_formula = modified_formula.replace(f'`{col}`', replacement)
+            else:
+                # Use word boundaries for regular column names
+                import re
+                modified_formula = re.sub(r'\b' + re.escape(col) + r'\b', replacement, modified_formula)
 
-                print(f"Pair {pair_idx}: Successfully merged. Shapes: {df1.shape} + {df2.shape} -> {merged_df.shape}")
+        return modified_formula
 
-            return merged_df
+    def flatten_dataframes(dataframes_input):
+        """
+        Flatten nested data structure into flat list of (location, DataFrame) tuples.
+        Also tracks the original structure for reassembly when inplace=False.
+        """
+        flat_list = []
+        structure_info = []
+
+        def _flatten(item, path):
+            if isinstance(item, pd.DataFrame):
+                flat_list.append((path, item))
+                structure_info.append((path, item))
+            elif isinstance(item, list):
+                for i, sub_item in enumerate(item):
+                    _flatten(sub_item, path + [i])
+            else:
+                if verbose:
+                    print(f"Warning: Skipping non-DataFrame at {path}: {type(item)}")
+
+        if isinstance(dataframes_input, pd.DataFrame):
+            flat_list.append(('Single DataFrame', dataframes_input))
+            structure_info.append(([], dataframes_input))
+        elif isinstance(dataframes_input, list):
+            _flatten(dataframes_input, [])
+        else:
+            if verbose:
+                print(f"Warning: Skipping non-DataFrame input: {type(dataframes_input)}")
+
+        return flat_list, structure_info
+
+    def reassemble_dataframes(processed_dfs, original_structure):
+        """
+        Reassemble processed DataFrames into the original input structure.
+        """
+        if not original_structure:
+            return None
+
+        # If single DataFrame was input
+        if len(original_structure) == 1 and original_structure[0][0] == []:
+            return processed_dfs[0] if processed_dfs else None
+
+        # Rebuild the nested structure
+        def _rebuild(structure):
+            if not structure:
+                return processed_dfs.pop(0) if processed_dfs else None
+
+            result = []
+            expected_count = len([s for s in structure if s[0] == []])
+            for i in range(expected_count):
+                if processed_dfs:
+                    result.append(processed_dfs.pop(0))
+            return result
+
+        return _rebuild(original_structure)
+
+    # Flatten the input structure
+    flat_dfs, original_structure = flatten_dataframes(dataframes)
+    processed_dataframes = []  # Store processed DataFrames when inplace=False
+
+    if not flat_dfs:
+        if verbose:
+            print("No DataFrames found to process")
+        return None if inplace else None
+
+    # Process each DataFrame
+    for location, df in flat_dfs:
+        try:
+            # Apply NaN handling if requested
+            final_formula = process_nan_handling(formula, df)
+            if final_formula != formula and verbose:
+                print(f"Using NaN-handled formula: {final_formula}")
+
+            # Work with copy if not inplace
+            if inplace:
+                working_df = df
+            else:
+                working_df = df.copy()
+
+            # Use pandas eval to apply the formula
+            working_df[new_column_name] = working_df.eval(final_formula)
+            results['successful'] += 1
+            results['total_processed'] += 1
+            results['formula_used'] = final_formula
+
+            if not inplace:
+                processed_dataframes.append(working_df)
+
+            if verbose:
+                action = "Modified" if inplace else "Created new"
+                print(f"✓ {action} DataFrame with formula '{final_formula}' -> '{new_column_name}' at {location}")
 
         except Exception as e:
+            results['failed'] += 1
+            results['total_processed'] += 1
+            error_msg = f"Error in {location}: {str(e)}"
+            results['errors'].append(error_msg)
+
             if verbose:
-                print(f"Pair {pair_idx}: Error during merge - {e}")
-            return None
+                print(f"✗ Failed to apply formula in {location}: {e}")
 
-    # Main function logic
-    # Convert single DataFrames to lists for uniform processing
-    single_df_mode = False
-    if isinstance(df1_input, pd.DataFrame) and isinstance(df2_input, pd.DataFrame):
-        df_list1 = [df1_input]
-        df_list2 = [df2_input]
-        single_df_mode = True
-    elif isinstance(df1_input, list) and isinstance(df2_input, list):
-        df_list1 = df1_input
-        df_list2 = df2_input
-    else:
-        raise ValueError("Both inputs must be either DataFrames or lists of DataFrames")
+            if not inplace:
+                # Include original DataFrame in results even if operation failed
+                processed_dataframes.append(df.copy())
 
-    # Handle different list lengths
-    if len(df_list1) != len(df_list2):
-        if verbose:
-            print(f"Warning: List lengths differ - list1: {len(df_list1)}, list2: {len(df_list2)}")
-        min_length = min(len(df_list1), len(df_list2))
-        df_list1 = df_list1[:min_length]
-        df_list2 = df_list2[:min_length]
-        if verbose:
-            print(f"Using first {min_length} pairs for merging")
-
+    # Print summary
     if verbose:
-        print(f"🔗 MERGE CONFIGURATION:")
-        print(f"   📊 Input pairs: {len(df_list1)}")
-        print(f"   🎯 Merge column: '{merge_column}'")
-        print(f"   🔄 Merge type: {how}")
-        print(f"   📝 Suffixes: {suffixes} (pandas defaults)")
-        print(f"   ✅ Validate: {validate}")
-        print(f"   📈 Indicator: {indicator} (no indicator)")
-        print(f"   🔄 Duplicate handling: {handle_duplicates} (no handling)")
-        print(f"   🚫 NaN handling: {handle_nan} (no handling)")
-        print(f"   🔧 Dtype conversion: {dtype_conversion}")
+        success_rate = (results['successful'] / results['total_processed']) * 100 if results[
+                                                                                         'total_processed'] > 0 else 0
+        operation_type = "IN-PLACE" if inplace else "NEW DATAFRAMES"
+        print(f"\n=== {operation_type} OPERATION SUMMARY ===")
+        print(f"Total processed: {results['total_processed']}")
+        print(f"Successful: {results['successful']} ({success_rate:.1f}%)")
+        print(f"Failed: {results['failed']}")
+        if final_formula != formula:
+            print(f"Final formula used: {final_formula}")
 
-    merged_dfs = []
-    successful_merges = 0
+        if results['errors']:
+            print(f"\nErrors encountered:")
+            for error in results['errors']:
+                print(f"  - {error}")
 
-    for i, (df1, df2) in enumerate(zip(df_list1, df_list2)):
-        merged_df = perform_single_merge(df1, df2, i)
-        if merged_df is not None:
-            merged_dfs.append(merged_df)
-            successful_merges += 1
+    # Return appropriate result based on inplace parameter
+    if inplace:
+        return results
+    else:
+        # Reassemble the DataFrames into the original structure
+        if isinstance(dataframes, pd.DataFrame):
+            return processed_dataframes[0] if processed_dataframes else None
         else:
-            # If merge fails, keep original DataFrames
-            if verbose:
-                print(f"Pair {i}: Merge failed, keeping original DataFrames")
-            merged_dfs.extend([df1, df2])
-
-    # Final summary
-    if verbose:
-        print(f"\n=== MERGE SUMMARY ===")
-        print(f"✅ Successful merges: {successful_merges}/{len(df_list1)}")
-        print(f"📊 Total output DataFrames: {len(merged_dfs)}")
-
-    # Return appropriate format
-    if single_df_mode and merged_dfs:
-        return merged_dfs[0]
-    else:
-        return merged_dfs
+            return processed_dataframes
