@@ -3,6 +3,13 @@ import pandas as pd
 import numpy as np
 import logging
 import inspect
+import pandas as pd
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError, GeocoderQuotaExceeded
+import logging
+import signal
+import sys
 import subprocess
 from typing import List, Union, Dict, Generator, Tuple, Callable, Any, Optional
 
@@ -3261,10 +3268,88 @@ def remove_duplicate_rows(
             return deduplicated_dfs[0] if single_df else deduplicated_dfs
 
 
-from typing import Union, List, Dict, Any, Optional
-import pandas as pd
-import numpy as np
+def rearrange_columns_smart(df: pd.DataFrame,
+                            patterns: Dict[str, List[str]] = None,
+                            priority_cols: List[str] = None,
+                            group_order: List[str] = None,
+                            inplace: bool = False) -> pd.DataFrame:
+    """
+    Rearrange columns using pattern matching and priority
 
+    Parameters:
+    df: Input DataFrame
+    patterns: Dictionary with pattern keys and column lists
+             e.g., {'id': ['id', 'ID', 'user_id'], 'date': ['date', 'timestamp']}
+    priority_cols: High priority columns to place first
+    group_order: Specify the order of pattern groups
+    inplace: If True, modifies the original DataFrame; if False, returns a new DataFrame (default: False)
+
+    Returns:
+    If inplace=True: Returns None (modifies original DataFrame)
+    If inplace=False: Returns new DataFrame with rearranged columns
+    """
+
+    if inplace:
+        # Work directly on the original DataFrame
+        result_df = df
+    else:
+        # Create a copy to avoid modifying the original
+        result_df = df.copy()
+
+    current_cols = result_df.columns.tolist()
+    result_cols = []
+    remaining_cols = current_cols.copy()
+
+    # Add priority columns first
+    if priority_cols:
+        for col in priority_cols:
+            if col in remaining_cols:
+                result_cols.append(col)
+                remaining_cols.remove(col)
+
+    # Pattern-based grouping
+    matched_cols_dict = {}
+    if patterns:
+        # First pass: exact matches
+        for pattern_name, pattern_cols in patterns.items():
+            matched_cols_dict[pattern_name] = []
+            for pattern_col in pattern_cols:
+                if pattern_col in remaining_cols:
+                    matched_cols_dict[pattern_name].append(pattern_col)
+                    remaining_cols.remove(pattern_col)
+
+        # Second pass: partial matches (contains)
+        for pattern_name, pattern_cols in patterns.items():
+            for pattern_col in pattern_cols:
+                for col in remaining_cols[:]:  # Copy for safe removal
+                    if pattern_col.lower() in col.lower():
+                        matched_cols_dict[pattern_name].append(col)
+                        remaining_cols.remove(col)
+                        break
+
+    # Determine group order
+    if group_order:
+        # Use specified group order
+        for group in group_order:
+            if group in matched_cols_dict:
+                result_cols.extend(matched_cols_dict[group])
+    else:
+        # Use natural order of patterns dictionary
+        for group_cols in matched_cols_dict.values():
+            result_cols.extend(group_cols)
+
+    # Add remaining columns
+    result_cols.extend(remaining_cols)
+
+    # Reorder the columns
+    result_df = result_df[result_cols]
+
+    if inplace:
+        # For inplace operation, we've already modified the original DataFrame
+        # by reassigning result_df to df and then reordering columns
+        return None
+    else:
+        return result_df
 
 def create_variable_eval(dataframes: Union[pd.DataFrame, List, List[List]],
                          new_column_name: str,
@@ -3610,3 +3695,180 @@ def create_variable_eval(dataframes: Union[pd.DataFrame, List, List[List]],
             return processed_dataframes[0] if processed_dataframes else None
         else:
             return processed_dataframes
+
+
+# Global stop flag
+GEOCODING_STOP_FLAG = False
+
+
+def stop_geocoding():
+    """Call this function to stop any running geocoding process"""
+    global GEOCODING_STOP_FLAG
+    GEOCODING_STOP_FLAG = True
+    print("🛑 Stop signal sent to geocoding function...")
+
+
+def reset_geocoding_flag():
+    """Reset the stop flag (call before starting new geocoding)"""
+    global GEOCODING_STOP_FLAG
+    GEOCODING_STOP_FLAG = False
+
+
+def geocode_addresses_auto(df, address_column, user_agent="my_geocoder_v1",
+                           lat_col='latitude', lon_col='longitude',
+                           full_address_col='full_address',
+                           geocode_status_col='geocode_status',
+                           min_delay=1,
+                           inplace=False):
+    """
+    Geocode addresses and automatically add coordinate columns to the DataFrame
+
+    Parameters:
+    df: Input DataFrame
+    address_column: Name of column containing addresses
+    user_agent: Unique identifier for geocoding service
+    lat_col: Name for latitude column (default: 'latitude')
+    lon_col: Name for longitude column (default: 'longitude')
+    full_address_col: Name for formatted address column (default: 'full_address')
+    geocode_status_col: Name for status column (default: 'geocode_status')
+    min_delay: Minimum delay between requests in seconds
+    inplace: If True, modifies the original DataFrame; if False, returns a new DataFrame (default: False)
+
+    Returns:
+    If inplace=True: Returns None (modifies original DataFrame)
+    If inplace=False: Returns new DataFrame with added coordinate columns
+    """
+
+    global GEOCODING_STOP_FLAG
+
+    # Reset stop flag at beginning
+    GEOCODING_STOP_FLAG = False
+
+    # Input validation
+    if address_column not in df.columns:
+        raise ValueError(f"Column '{address_column}' not found in DataFrame")
+
+    if df.empty:
+        print("Warning: DataFrame is empty")
+        return df if not inplace else None
+
+    # Initialize geocoder with error handling
+    try:
+        geolocator = Nominatim(user_agent=user_agent, timeout=10)
+        geocode = RateLimiter(geolocator.geocode, min_delay_seconds=min_delay)
+    except Exception as e:
+        logging.error(f"Failed to initialize geocoder: {e}")
+        raise
+
+    # Initialize lists for results
+    latitudes, longitudes, full_addresses, statuses = [], [], [], []
+
+    print(f"Geocoding {len(df)} addresses...")
+    print("💡 Tip: Call stop_geocoding() from another terminal or thread to stop early")
+
+    processed_count = 0
+    interrupted = False
+
+    for idx, address in enumerate(df[address_column]):
+        # Check global stop flag
+        if GEOCODING_STOP_FLAG:
+            print(f"\n🛑 Stop flag detected. Stopping after {processed_count} addresses...")
+            interrupted = True
+            # Fill remaining entries with interrupted status
+            remaining = len(df) - idx
+            latitudes.extend([None] * remaining)
+            longitudes.extend([None] * remaining)
+            full_addresses.extend([None] * remaining)
+            statuses.extend(['INTERRUPTED'] * remaining)
+            break
+
+        try:
+            # Handle NaN/None addresses
+            if pd.isna(address) or address == '':
+                latitudes.append(None)
+                longitudes.append(None)
+                full_addresses.append(None)
+                statuses.append('EMPTY_ADDRESS')
+                processed_count += 1
+                continue
+
+            # Attempt geocoding
+            location = geocode(str(address))
+
+            if location:
+                latitudes.append(location.latitude)
+                longitudes.append(location.longitude)
+                full_addresses.append(location.address)
+                statuses.append('SUCCESS')
+            else:
+                latitudes.append(None)
+                longitudes.append(None)
+                full_addresses.append(None)
+                statuses.append('NO_RESULTS')
+
+        except GeocoderTimedOut:
+            latitudes.append(None)
+            longitudes.append(None)
+            full_addresses.append(None)
+            statuses.append('TIMEOUT')
+            logging.warning(f"Timeout for address: {address}")
+
+        except GeocoderServiceError as e:
+            latitudes.append(None)
+            longitudes.append(None)
+            full_addresses.append(None)
+            statuses.append('SERVICE_ERROR')
+            logging.warning(f"Service error for address: {address} - {e}")
+
+        except GeocoderQuotaExceeded:
+            latitudes.append(None)
+            longitudes.append(None)
+            full_addresses.append(None)
+            statuses.append('QUOTA_EXCEEDED')
+            logging.error("Geocoding quota exceeded")
+            break
+
+        except Exception as e:
+            latitudes.append(None)
+            longitudes.append(None)
+            full_addresses.append(None)
+            statuses.append('UNKNOWN_ERROR')
+            logging.warning(f"Unexpected error for address: {address} - {e}")
+
+        processed_count += 1
+
+        # Progress indicator
+        if processed_count % 10 == 0:
+            print(f"📍 Processed {processed_count}/{len(df)} addresses...")
+
+    # Handle inplace vs return new DataFrame
+    if inplace:
+        # Modify original DataFrame directly
+        df[lat_col] = latitudes
+        df[lon_col] = longitudes
+        df[full_address_col] = full_addresses
+        df[geocode_status_col] = statuses
+        result_df = None
+    else:
+        # Create a copy of the DataFrame
+        result_df = df.copy()
+        result_df[lat_col] = latitudes
+        result_df[lon_col] = longitudes
+        result_df[full_address_col] = full_addresses
+        result_df[geocode_status_col] = statuses
+
+    # Print summary
+    success_count = statuses.count('SUCCESS')
+    success_rate = (success_count / len(statuses)) * 100 if statuses else 0
+
+    if interrupted:
+        print(
+            f"🔸 Geocoding interrupted. Partial results: {success_rate:.1f}% success ({success_count}/{processed_count} processed)")
+    else:
+        print(f"✅ Geocoding completed. Success rate: {success_rate:.1f}% ({success_count}/{len(statuses)})")
+
+    print("Status distribution:")
+    status_series = pd.Series(statuses)
+    print(status_series.value_counts())
+
+    return result_df if not inplace else None
